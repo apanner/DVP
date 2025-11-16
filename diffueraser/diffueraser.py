@@ -72,85 +72,177 @@ def resize_frames(frames, size=None):
     return frames
 
 def read_mask(validation_mask, fps, n_total_frames, img_size, mask_dilation_iter, frames):
-    cap = cv2.VideoCapture(validation_mask)
-    if not cap.isOpened():
-        print("Error: Could not open mask video.")
-        exit()
-    mask_fps = cap.get(cv2.CAP_PROP_FPS)
-    if mask_fps != fps:
+    """
+    Read mask video or image sequence
+    Supports video files and image sequences (directory)
+    """
+    import os
+    
+    # Check if input is a directory (image sequence) or file (video)
+    if os.path.isdir(validation_mask):
+        # Image sequence - use our custom reader
+        try:
+            from utils.image_utils import read_image_sequence
+            frames_pil, metadata_list, mask_fps, format_type = read_image_sequence(validation_mask, is_mask=True)
+            masks = frames_pil[:n_total_frames]  # Already PIL Images, grayscale
+            
+            # Process masks (resize, erode, dilate)
+            processed_masks = []
+            masked_images = []
+            for idx, mask in enumerate(masks):
+                if mask.size != img_size:
+                    mask = mask.resize(img_size, Image.NEAREST)
+                mask = np.asarray(mask)
+                m = np.array(mask > 0).astype(np.uint8)
+                m = cv2.erode(m,
+                            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+                            iterations=1)
+                m = cv2.dilate(m,
+                            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+                            iterations=mask_dilation_iter)
+                
+                mask = Image.fromarray(m * 255)
+                processed_masks.append(mask)
+                
+                masked_image = np.array(frames[idx])*(1-(np.array(mask)[:,:,np.newaxis].astype(np.float32)/255))
+                masked_image = Image.fromarray(masked_image.astype(np.uint8))
+                masked_images.append(masked_image)
+            
+            return processed_masks, masked_images
+        except ImportError:
+            raise ImportError("utils.image_utils not found. Make sure utils/ folder is in your repository.")
+    else:
+        # Video file - use original cv2.VideoCapture method
+        cap = cv2.VideoCapture(validation_mask)
+        if not cap.isOpened():
+            print("Error: Could not open mask video.")
+            exit()
+        mask_fps = cap.get(cv2.CAP_PROP_FPS)
+        if mask_fps != fps:
+            cap.release()
+            raise ValueError("The frame rate of all input videos needs to be consistent.")
+
+        masks = []
+        masked_images = []
+        idx = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:  
+                break
+            if(idx >= n_total_frames):
+                break
+            mask = Image.fromarray(frame[...,::-1]).convert('L')
+            if mask.size != img_size:
+                mask = mask.resize(img_size, Image.NEAREST)
+            mask = np.asarray(mask)
+            m = np.array(mask > 0).astype(np.uint8)
+            m = cv2.erode(m,
+                        cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+                        iterations=1)
+            m = cv2.dilate(m,
+                        cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+                        iterations=mask_dilation_iter)
+
+            mask = Image.fromarray(m * 255)
+            masks.append(mask)
+
+            masked_image = np.array(frames[idx])*(1-(np.array(mask)[:,:,np.newaxis].astype(np.float32)/255))
+            masked_image = Image.fromarray(masked_image.astype(np.uint8))
+            masked_images.append(masked_image)
+
+            idx += 1
         cap.release()
-        raise ValueError("The frame rate of all input videos needs to be consistent.")
 
-    masks = []
-    masked_images = []
-    idx = 0
-    while True:
-        ret, frame = cap.read()
-        if not ret:  
-            break
-        if(idx >= n_total_frames):
-            break
-        mask = Image.fromarray(frame[...,::-1]).convert('L')
-        if mask.size != img_size:
-            mask = mask.resize(img_size, Image.NEAREST)
-        mask = np.asarray(mask)
-        m = np.array(mask > 0).astype(np.uint8)
-        m = cv2.erode(m,
-                    cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
-                    iterations=1)
-        m = cv2.dilate(m,
-                    cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
-                    iterations=mask_dilation_iter)
-
-        mask = Image.fromarray(m * 255)
-        masks.append(mask)
-
-        masked_image = np.array(frames[idx])*(1-(np.array(mask)[:,:,np.newaxis].astype(np.float32)/255))
-        masked_image = Image.fromarray(masked_image.astype(np.uint8))
-        masked_images.append(masked_image)
-
-        idx += 1
-    cap.release()
-
-    return masks, masked_images
+        return masks, masked_images
 
 def read_priori(priori, fps, n_total_frames, img_size):
-    cap = cv2.VideoCapture(priori)
-    if not cap.isOpened():
-        print("Error: Could not open video.")
-        exit()
-    priori_fps = cap.get(cv2.CAP_PROP_FPS)
-    if priori_fps != fps:
+    """
+    Read priori video or image sequence
+    Supports video files and image sequences (directory)
+    """
+    import os
+    
+    # Check if input is a directory (image sequence) or file (video)
+    if os.path.isdir(priori):
+        # Image sequence - use our custom reader
+        try:
+            from utils.image_utils import read_image_sequence
+            frames_pil, metadata_list, priori_fps, format_type = read_image_sequence(priori, is_mask=False)
+            prioris = frames_pil[:n_total_frames]  # Already PIL Images
+            
+            # Resize if needed
+            resized_prioris = []
+            for img in prioris:
+                if img.size != img_size:
+                    img = img.resize(img_size)
+                resized_prioris.append(img)
+            
+            return resized_prioris
+        except ImportError:
+            raise ImportError("utils.image_utils not found. Make sure utils/ folder is in your repository.")
+    else:
+        # Video file - use original cv2.VideoCapture method
+        cap = cv2.VideoCapture(priori)
+        if not cap.isOpened():
+            print("Error: Could not open video.")
+            exit()
+        priori_fps = cap.get(cv2.CAP_PROP_FPS)
+        if priori_fps != fps:
+            cap.release()
+            raise ValueError("The frame rate of all input videos needs to be consistent.")
+
+        prioris=[]
+        idx = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret: 
+                break
+            if(idx >= n_total_frames):
+                break
+            img = Image.fromarray(frame[...,::-1])
+            if img.size != img_size:
+                img = img.resize(img_size)
+            prioris.append(img)
+            idx += 1
         cap.release()
-        raise ValueError("The frame rate of all input videos needs to be consistent.")
 
-    prioris=[]
-    idx = 0
-    while True:
-        ret, frame = cap.read()
-        if not ret: 
-            break
-        if(idx >= n_total_frames):
-            break
-        img = Image.fromarray(frame[...,::-1])
-        if img.size != img_size:
-            img = img.resize(img_size)
-        prioris.append(img)
-        idx += 1
-    cap.release()
+        os.remove(priori) # remove priori (only if it's a video file)
 
-    os.remove(priori) # remove priori 
-
-    return prioris
+        return prioris
 
 def read_video(validation_image, video_length, nframes, max_img_size):
-    vframes, aframes, info = torchvision.io.read_video(filename=validation_image, pts_unit='sec', end_pts=video_length) # RGB
-    fps = info['video_fps']
-    n_total_frames = int(video_length * fps)
-    n_clip = int(np.ceil(n_total_frames/nframes))
-
-    frames = list(vframes.numpy())[:n_total_frames]
-    frames = [Image.fromarray(f) for f in frames]
+    """
+    Read video or image sequence
+    Supports:
+    - Video files (MP4, etc.) via torchvision
+    - Image sequences (directory with EXR, TIFF, PNG, JPG) via utils.image_utils
+    """
+    import os
+    
+    # Check if input is a directory (image sequence) or file (video)
+    if os.path.isdir(validation_image):
+        # Image sequence - use our custom reader
+        try:
+            from utils.image_utils import read_image_sequence
+            frames_pil, metadata_list, fps, format_type = read_image_sequence(validation_image, is_mask=False)
+            frames = frames_pil  # Already PIL Images
+            n_total_frames = len(frames)
+            if video_length and video_length > 0:
+                # Limit frames based on video_length
+                max_frames = int(video_length * fps)
+                frames = frames[:max_frames]
+                n_total_frames = len(frames)
+        except ImportError:
+            raise ImportError("utils.image_utils not found. Make sure utils/ folder is in your repository.")
+    else:
+        # Video file - use original torchvision method
+        vframes, aframes, info = torchvision.io.read_video(filename=validation_image, pts_unit='sec', end_pts=video_length) # RGB
+        fps = info['video_fps']
+        n_total_frames = int(video_length * fps) if video_length else len(vframes)
+        frames = list(vframes.numpy())[:n_total_frames]
+        frames = [Image.fromarray(f) for f in frames]
+    
+    n_clip = int(np.ceil(n_total_frames/nframes)) if nframes > 0 else 1
     max_size = max(frames[0].size)
     if(max_size<256):
         raise ValueError("The resolution of the uploaded video must be larger than 256x256.")
@@ -179,6 +271,8 @@ class DiffuEraser:
     def __init__(
             self, device, base_model_path, vae_path, diffueraser_path, revision=None,
             ckpt="Normal CFG 4-Step", mode="sd15", loaded=None):
+        # Store input format for output format detection (default to EXR for high quality)
+        self._input_format = 'exr'
         self.device = device
 
         ## load model
@@ -416,13 +510,53 @@ class DiffuEraser:
                 + np.array(resized_frames_ori[i]).astype(np.uint8) * (1 - mask)).astype(np.uint8)
             comp_frames.append(Image.fromarray(img))
 
-        default_fps = fps
-        writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"),
+        # Check if output_path is a directory (image sequence) or file (video)
+        import os
+        if os.path.isdir(output_path) or not output_path.endswith(('mp4', 'mov', 'avi', 'MP4', 'MOV', 'AVI')):
+            # Save as image sequence
+            os.makedirs(output_path, exist_ok=True)
+            
+            # Detect format from input (if available)
+            output_format = 'exr'  # Default to EXR for high quality
+            try:
+                # Try to detect from input
+                if hasattr(self, '_input_format'):
+                    output_format = self._input_format
+                elif os.path.isdir(validation_image):
+                    # Check input directory format
+                    from utils.image_utils import detect_image_format
+                    input_files = sorted([f for f in os.listdir(validation_image) 
+                                         if f.lower().endswith(('.exr', '.tiff', '.tif', '.png', '.jpg', '.jpeg'))])
+                    if input_files:
+                        output_format = detect_image_format(input_files[0])
+            except:
+                pass
+            
+            # Save using image_utils (handles EXR, TIFF, PNG, JPG)
+            try:
+                from utils.image_utils import write_image_sequence
+                write_image_sequence(comp_frames[:real_video_length], output_path, 
+                                   format_type=output_format, prefix="frame", start_frame=0)
+                print(f"Saved {real_video_length} {output_format.upper()} frames to: {output_path}")
+            except Exception as e:
+                print(f"Warning: Failed to save image sequence: {e}, falling back to video")
+                # Fallback to video
+                default_fps = fps
+                writer = cv2.VideoWriter(output_path + ".mp4", cv2.VideoWriter_fourcc(*"mp4v"),
+                                default_fps, comp_frames[0].size)
+                for f in range(real_video_length):
+                    img = np.array(comp_frames[f]).astype(np.uint8)
+                    writer.write(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+                writer.release()
+        else:
+            # Save as video (original behavior)
+            default_fps = fps
+            writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"),
                             default_fps, comp_frames[0].size)
-        for f in range(real_video_length):
-            img = np.array(comp_frames[f]).astype(np.uint8)
-            writer.write(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-        writer.release()
+            for f in range(real_video_length):
+                img = np.array(comp_frames[f]).astype(np.uint8)
+                writer.write(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+            writer.release()
         ################################
 
         return output_path

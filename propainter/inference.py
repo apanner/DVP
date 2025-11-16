@@ -55,15 +55,41 @@ def read_frame_from_videos(frame_root, video_length):
         fps = info['video_fps']
         nframes = len(frames)
     else:
+        # Directory with image sequence - check if EXR
         video_name = os.path.basename(frame_root)
         frames = []
-        fr_lst = sorted(os.listdir(frame_root))
-        for fr in fr_lst:
-            frame = cv2.imread(os.path.join(frame_root, fr))
-            frame = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            frames.append(frame)
-        fps = None
-        nframes = len(frames)
+        
+        # Check if EXR files exist
+        exr_files = sorted([f for f in os.listdir(frame_root) if f.lower().endswith('.exr')])
+        if exr_files:
+            # Use EXR reader for proper color space conversion
+            try:
+                from utils.exr_utils import read_exr_sequence
+                frames, metadata_list, fps = read_exr_sequence(frame_root, pattern="*.exr")
+                nframes = len(frames)
+            except ImportError:
+                print("Warning: OpenEXR not available, trying cv2 fallback")
+                # Fallback to cv2 (may not work well for EXR)
+                fr_lst = sorted(os.listdir(frame_root))
+                for fr in fr_lst:
+                    if fr.lower().endswith(('.exr', '.tiff', '.tif', '.png', '.jpg', '.jpeg')):
+                        frame = cv2.imread(os.path.join(frame_root, fr))
+                        if frame is not None:
+                            frame = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                            frames.append(frame)
+                fps = None
+                nframes = len(frames)
+        else:
+            # Non-EXR image sequence
+            fr_lst = sorted(os.listdir(frame_root))
+            for fr in fr_lst:
+                if fr.lower().endswith(('.tiff', '.tif', '.png', '.jpg', '.jpeg')):
+                    frame = cv2.imread(os.path.join(frame_root, fr))
+                    if frame is not None:
+                        frame = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                        frames.append(frame)
+            fps = None
+            nframes = len(frames)
     size = frames[0].size
 
     return frames, fps, size, video_name, nframes
@@ -96,11 +122,26 @@ def read_mask(mpath, frames_len, size, flow_mask_dilates=8, mask_dilates=5):
             masks_img.append(Image.fromarray(frame))
             idx += 1
         cap.release()
-    else:  
+    else:
+        # Directory with mask sequence - check if EXR
         mnames = sorted(os.listdir(mpath))
-        for mp in mnames:
-            masks_img.append(Image.open(os.path.join(mpath, mp)))
-            # print(mp)
+        exr_files = [f for f in mnames if f.lower().endswith('.exr')]
+        if exr_files:
+            # Use EXR mask reader for proper handling
+            try:
+                from utils.exr_utils import read_exr_mask_sequence
+                masks_img = read_exr_mask_sequence(mpath, pattern="*.exr")
+            except ImportError:
+                print("Warning: OpenEXR not available, trying PIL fallback")
+                # Fallback to PIL
+                for mp in mnames:
+                    if mp.lower().endswith(('.exr', '.tiff', '.tif', '.png', '.jpg', '.jpeg')):
+                        masks_img.append(Image.open(os.path.join(mpath, mp)))
+        else:
+            # Non-EXR mask sequence
+            for mp in mnames:
+                if mp.lower().endswith(('.tiff', '.tif', '.png', '.jpg', '.jpeg')):
+                    masks_img.append(Image.open(os.path.join(mpath, mp)))
           
     for mask_img in masks_img:
         if size is not None:
@@ -175,6 +216,9 @@ class Propainter:
     def forward(self, video, mask, output_path, resize_ratio=0.6, video_length=2, height=-1, width=-1,
                 mask_dilation=4, ref_stride=10, neighbor_length=10, subvideo_length=80,
                 raft_iter=20, save_fps=24, save_frames=False, fp16=True):
+        
+        # Store input path for format detection
+        self._input_video_path = video
         
         # Use fp16 precision during inference to reduce running memory cost
         use_half = True if fp16 else False 
@@ -490,14 +534,72 @@ class Propainter:
             
             torch.cuda.empty_cache()
 
-        ##save composed video##
+        ##save composed video or image sequence##
         comp_frames = [cv2.resize(f, out_size) for f in comp_frames]
-        writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"),
-                                fps, (comp_frames[0].shape[1],comp_frames[0].shape[0]))
-        for f in range(video_length):
-            frame = comp_frames[f].astype(np.uint8)
-            writer.write(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        writer.release()
+        
+        # Check if output_path is a directory (image sequence) or file (video)
+        if os.path.isdir(output_path) or not output_path.endswith(('mp4', 'mov', 'avi', 'MP4', 'MOV', 'AVI')):
+            # Save as image sequence - detect format from input or use EXR for high quality
+            os.makedirs(output_path, exist_ok=True)
+            
+            # Try to detect desired format from input video path (if it's a directory with images)
+            output_format = 'exr'  # Default to EXR for high quality
+            if hasattr(self, '_input_video_path') and self._input_video_path:
+                # Check if input was a directory with images
+                if os.path.isdir(self._input_video_path):
+                    # Check first frame format
+                    frame_files = sorted([f for f in os.listdir(self._input_video_path) 
+                                         if f.lower().endswith(('.exr', '.tiff', '.tif', '.png', '.jpg', '.jpeg'))])
+                    if frame_files:
+                        ext = os.path.splitext(frame_files[0])[1].lower()
+                        if ext == '.exr':
+                            output_format = 'exr'
+                        elif ext in ['.tiff', '.tif']:
+                            output_format = 'tiff'
+                        elif ext in ['.jpg', '.jpeg']:
+                            output_format = 'jpg'
+                        else:
+                            output_format = 'png'
+            
+            # Try to use EXR utilities for high-quality output
+            try:
+                from utils.exr_utils import write_exr_file
+                from utils.image_utils import write_image_sequence
+                use_exr = (output_format == 'exr')
+            except ImportError:
+                use_exr = False
+                from utils.image_utils import write_image_sequence
+            
+            if use_exr:
+                # Save as EXR (high quality, float32)
+                for f in range(video_length):
+                    frame = comp_frames[f].astype(np.float32) / 255.0  # Convert to [0, 1] float
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    # Write EXR (linear color space)
+                    frame_filename = os.path.join(output_path, f"frame_{f:04d}.exr")
+                    write_exr_file(frame_filename, frame_rgb)
+                print(f"Saved {video_length} EXR frames to: {output_path}")
+            else:
+                # Save using image_utils (supports EXR, TIFF, PNG, JPG)
+                frames_pil = []
+                for f in range(video_length):
+                    frame = comp_frames[f].astype(np.uint8)
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    frame_pil = Image.fromarray(frame_rgb)
+                    frames_pil.append(frame_pil)
+                
+                # Use write_image_sequence which handles format conversion
+                write_image_sequence(frames_pil, output_path, format_type=output_format, 
+                                   prefix="frame", start_frame=0)
+                print(f"Saved {video_length} {output_format.upper()} frames to: {output_path}")
+        else:
+            # Save as video (original behavior)
+            writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"),
+                                    fps, (comp_frames[0].shape[1],comp_frames[0].shape[0]))
+            for f in range(video_length):
+                frame = comp_frames[f].astype(np.uint8)
+                writer.write(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            writer.release()
         
         torch.cuda.empty_cache()
 
