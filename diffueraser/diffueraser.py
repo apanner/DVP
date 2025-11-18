@@ -303,9 +303,11 @@ class DiffuEraser:
             vae=self.vae,
             text_encoder=self.text_encoder,
             tokenizer=self.tokenizer,
-            unet=self.unet_main,
             brushnet=self.brushnet
         ).to(self.device, torch.float16)
+        # Replace default UNet with motion-aware UNet after pipeline instantiation
+        self.unet_main = self.unet_main.to(self.device, dtype=torch.float16)
+        self.pipeline.unet = self.unet_main
         self.pipeline.scheduler = UniPCMultistepScheduler.from_config(self.pipeline.scheduler.config)
         self.pipeline.set_progress_bar_config(disable=True)
 
@@ -318,9 +320,7 @@ class DiffuEraser:
         PCM_ckpts = checkpoints[ckpt][0].format(mode)
         self.guidance_scale = checkpoints[ckpt][2]
         if loaded != (ckpt + mode):
-            self.pipeline.load_lora_weights(
-                "weights/PCM_Weights", weight_name=PCM_ckpts, subfolder=mode
-            )
+            self._load_pcm_adapter(diffueraser_path, mode, PCM_ckpts)
             loaded = ckpt + mode
 
             if ckpt == "LCM-Like LoRA":
@@ -335,6 +335,42 @@ class DiffuEraser:
                 )
         self.num_inference_steps = checkpoints[ckpt][1]
         self.guidance_scale = 0
+
+    def _load_pcm_adapter(self, diffueraser_path: str, mode: str, weight_name: str) -> None:
+        """Load PCM LoRA weights into the motion UNet using load_attn_procs."""
+        adapter_name = f"pcm_{mode}"
+        pcm_dir = self._find_pcm_directory(diffueraser_path, mode, weight_name)
+        print(f"[PCM] Loading adapter '{adapter_name}' from: {os.path.join(pcm_dir, weight_name)}")
+        self.unet_main.load_attn_procs(
+            pcm_dir,
+            weight_name=weight_name,
+            subfolder=None,
+            adapter_name=adapter_name,
+            local_files_only=True,
+            _pipeline=self.pipeline,
+        )
+        try:
+            self.pipeline.set_adapters(adapter_name)
+            if hasattr(self.pipeline, "set_lora_scale"):
+                self.pipeline.set_lora_scale(1.0)
+        except AttributeError:
+            pass
+
+    def _find_pcm_directory(self, diffueraser_path: str, mode: str, weight_name: str) -> str:
+        """Resolve the on-disk directory that contains the requested PCM weight file."""
+        candidates = [
+            os.path.join(diffueraser_path, "weights", "PCM_Weights", mode),
+            os.path.join("weights", "PCM_Weights", mode),
+            os.path.join("/content/models", "PCM_Weights", mode),
+        ]
+        for folder in candidates:
+            candidate_file = os.path.join(folder, weight_name)
+            if os.path.isfile(candidate_file):
+                return folder
+        raise FileNotFoundError(
+            f"PCM weight '{weight_name}' for mode '{mode}' not found in any known location. "
+            f"Checked: {candidates}"
+        )
 
     def forward(self, validation_image, validation_mask, priori, output_path,
                 max_img_size = 1280, video_length=2, mask_dilation_iter=4,
