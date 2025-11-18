@@ -170,20 +170,15 @@ def read_image_sequence(sequence_path: str, pattern: str = None, is_mask: bool =
         try:
             from utils.exr_utils import read_exr_sequence, read_exr_mask_sequence
             if is_mask:
-                # Use mask-specific EXR reader for masks
                 frames = read_exr_mask_sequence(sequence_path, pattern or "*.exr")
                 metadata_list = [{'path': '', 'format': 'exr', 'size': f.size} for f in frames]
                 fps = 24.0
                 return frames, metadata_list, fps, 'exr'
-            else:
-                frames, metadata_list, fps = read_exr_sequence(sequence_path, pattern or "*.exr")
-                return frames, metadata_list, fps, 'exr'
-        except ImportError:
-            logger.warning("OpenEXR not available, trying PIL fallback")
-            format_type = 'png'  # Fallback
+            frames, metadata_list, fps = read_exr_sequence(sequence_path, pattern or "*.exr")
+            return frames, metadata_list, fps, 'exr'
         except Exception as e:
-            logger.warning(f"EXR read failed: {e}, trying PIL fallback")
-            format_type = 'png'  # Fallback
+            logger.warning(f"EXR read failed via OpenCV pipeline: {e}, falling back to PNG")
+            format_type = 'png'
     
     # Read using PIL for standard formats
     for img_path in image_files:
@@ -247,14 +242,12 @@ def write_image_sequence(frames: List[Image.Image], output_dir: str,
         frame_num = start_frame + i
         
         if format_type.lower() == 'exr':
-            # Use EXR utils
             try:
                 from utils.exr_utils import write_exr_sequence
-                # Write single frame
                 write_exr_sequence([pil_img], output_dir, metadata_list, prefix, frame_num)
                 continue
-            except ImportError:
-                logger.warning("OpenEXR not available, saving as PNG instead")
+            except Exception as e:
+                logger.warning(f"EXR write failed via OpenCV pipeline ({e}), saving as PNG instead")
                 format_type = 'png'
         
         # Determine extension

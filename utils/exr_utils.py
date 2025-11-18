@@ -6,10 +6,8 @@ import os
 import glob
 import numpy as np
 from PIL import Image
-import OpenEXR
-import Imath
+import cv2
 from typing import List, Tuple, Optional
-import colorsys
 
 
 def linear_to_srgb(linear: np.ndarray) -> np.ndarray:
@@ -50,7 +48,7 @@ def srgb_to_linear(srgb: np.ndarray) -> np.ndarray:
 
 def read_exr_file(exr_path: str) -> Tuple[np.ndarray, dict]:
     """
-    Read a single EXR file
+    Read a single EXR file using OpenCV.
     Args:
         exr_path: Path to EXR file
     Returns:
@@ -59,71 +57,30 @@ def read_exr_file(exr_path: str) -> Tuple[np.ndarray, dict]:
     if not os.path.exists(exr_path):
         raise FileNotFoundError(f"EXR file not found: {exr_path}")
     
-    exr_file = OpenEXR.InputFile(exr_path)
-    header = exr_file.header()
+    img = cv2.imread(exr_path, cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
+    if img is None:
+        raise ValueError(f"cv2.imread failed to load EXR: {exr_path}")
     
-    # Get image dimensions
-    dw = header['dataWindow']
-    width = dw.max.x - dw.min.x + 1
-    height = dw.max.y - dw.min.y + 1
+    if len(img.shape) == 2:
+        img = np.expand_dims(img, axis=2)
     
-    # Determine channels
-    channels = header['channels']
-    channel_names = list(channels.keys())
+    if img.shape[2] == 3:
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     
-    # Read RGB channels (handle different channel names)
-    r_channel = None
-    g_channel = None
-    b_channel = None
-    
-    for ch_name in ['R', 'Red', 'RED', 'r']:
-        if ch_name in channel_names:
-            r_channel = ch_name
-            break
-    
-    for ch_name in ['G', 'Green', 'GREEN', 'g']:
-        if ch_name in channel_names:
-            g_channel = ch_name
-            break
-    
-    for ch_name in ['B', 'Blue', 'BLUE', 'b']:
-        if ch_name in channel_names:
-            b_channel = ch_name
-            break
-    
-    if not all([r_channel, g_channel, b_channel]):
-        raise ValueError(f"Could not find RGB channels in EXR file. Available: {channel_names}")
-    
-    # Read pixel data
-    pixel_type = channels[r_channel].type
-    if pixel_type == Imath.PixelType(Imath.PixelType.HALF):
-        dtype = np.float16
-    elif pixel_type == Imath.PixelType(Imath.PixelType.FLOAT):
-        dtype = np.float32
+    if img.dtype in (np.uint16, np.uint8):
+        max_val = np.iinfo(img.dtype).max
+        img = img.astype(np.float32) / max_val
     else:
-        dtype = np.float32
+        img = img.astype(np.float32)
     
-    r_str = exr_file.channel(r_channel, Imath.PixelType(Imath.PixelType.FLOAT))
-    g_str = exr_file.channel(g_channel, Imath.PixelType(Imath.PixelType.FLOAT))
-    b_str = exr_file.channel(b_channel, Imath.PixelType(Imath.PixelType.FLOAT))
-    
-    r = np.frombuffer(r_str, dtype=np.float32).reshape(height, width)
-    g = np.frombuffer(g_str, dtype=np.float32).reshape(height, width)
-    b = np.frombuffer(b_str, dtype=np.float32).reshape(height, width)
-    
-    # Stack into RGB image
-    img = np.stack([r, g, b], axis=2)
-    
-    # Store metadata
+    height, width = img.shape[:2]
     metadata = {
         'width': width,
         'height': height,
-        'channels': channel_names,
-        'pixel_type': str(pixel_type),
-        'header': header
+        'channels': ['R', 'G', 'B'] if img.shape[2] == 3 else ['Y'],
+        'pixel_type': str(img.dtype),
+        'source': 'opencv'
     }
-    
-    exr_file.close()
     return img, metadata
 
 
@@ -135,71 +92,19 @@ def write_exr_file(output_path: str, img: np.ndarray, metadata: Optional[dict] =
         img: Image array in linear color space [H, W, 3] or [H, W] as numpy array
         metadata: Optional metadata dict from original EXR
     """
-    # Ensure float32
+    if img.ndim == 2:
+        img = np.expand_dims(img, axis=2)
+    
     img = img.astype(np.float32)
     
-    if len(img.shape) == 2:
-        # Grayscale
-        height, width = img.shape
-        channels = {'Y': img}
-    elif len(img.shape) == 3:
-        # RGB
-        height, width, channels_count = img.shape
-        if channels_count == 3:
-            channels = {
-                'R': img[:, :, 0],
-                'G': img[:, :, 1],
-                'B': img[:, :, 2]
-            }
-        elif channels_count == 1:
-            channels = {'Y': img[:, :, 0]}
-        else:
-            raise ValueError(f"Unsupported channel count: {channels_count}")
+    if img.shape[2] == 3:
+        img_to_write = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
     else:
-        raise ValueError(f"Unsupported image shape: {img.shape}")
+        img_to_write = img
     
-    # Create header
-    header = OpenEXR.Header(width, height)
-    if metadata and 'header' in metadata:
-        # Copy relevant attributes from original
-        orig_header = metadata['header']
-        if 'compression' in orig_header:
-            header['compression'] = orig_header['compression']
-        if 'channels' in orig_header:
-            # Use original channel structure if available
-            pass
-    
-    # Set pixel type to FLOAT
-    header['channels'] = {ch: Imath.Channel(Imath.PixelType(Imath.PixelType.FLOAT)) 
-                          for ch in channels.keys()}
-    
-    # Create EXR file
-    exr_file = OpenEXR.OutputFile(output_path, header)
-    
-    # Prepare channel data as float32 arrays
-    channel_arrays = {}
-    for ch_name, ch_data in channels.items():
-        ch_data_float = ch_data.astype(np.float32)
-        # Ensure data is contiguous
-        if not ch_data_float.flags['C_CONTIGUOUS']:
-            ch_data_float = np.ascontiguousarray(ch_data_float)
-        channel_arrays[ch_name] = ch_data_float
-    
-    # Write scanline by scanline (OpenEXR Python API requirement)
-    for y in range(height):
-        scanline_dict = {}
-        for ch_name, ch_array in channel_arrays.items():
-            # Extract one scanline: y-th row
-            scanline = ch_array[y, :].astype(np.float32)
-            # Ensure contiguous
-            if not scanline.flags['C_CONTIGUOUS']:
-                scanline = np.ascontiguousarray(scanline)
-            # Convert to bytes
-            scanline_bytes = scanline.tobytes()
-            scanline_dict[ch_name] = scanline_bytes
-        exr_file.writePixels(scanline_dict)
-    
-    exr_file.close()
+    success = cv2.imwrite(output_path, img_to_write)
+    if not success:
+        raise RuntimeError(f"Failed to write EXR file: {output_path}")
 
 
 def read_exr_sequence(sequence_path: str, pattern: str = "*.exr") -> Tuple[List[Image.Image], List[dict], float]:
