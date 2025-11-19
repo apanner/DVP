@@ -4,7 +4,9 @@ Handles reading/writing EXR image sequences with proper color space conversion
 USES OpenEXR Python bindings for EXR (OpenCV from pip doesn't have EXR support)
 Falls back to OpenCV for other formats
 
-NOTE: OpenEXR>=3.3.1 includes the Imath module, so no separate Imath installation needed.
+NOTE: Supports both installation methods:
+  - Separate packages: pip install Imath OpenEXR (works for all versions)
+  - Newer versions: pip install OpenEXR>=3.4.0 (includes Imath)
 """
 import os
 import glob
@@ -18,14 +20,30 @@ logger = logging.getLogger(__name__)
 
 # Try to import OpenEXR - required for EXR file reading
 # OpenCV from pip doesn't have EXR support compiled in
-# OpenEXR>=3.3.1 includes Imath module, so import Imath works automatically
+# Handles both:
+#   - Separate Imath package (older versions: OpenEXR==1.3.2 + Imath==0.0.2)
+#   - Imath included in OpenEXR (newer versions: OpenEXR>=3.4.0)
 try:
     import OpenEXR
-    import Imath  # Included in OpenEXR>=3.3.1
+    
+    # Try importing Imath - handle both separate package and included module
+    try:
+        import Imath  # Separate package (older versions)
+    except ImportError:
+        # Try Imath as submodule of OpenEXR (newer versions >=3.4.0)
+        if hasattr(OpenEXR, 'Imath'):
+            Imath = OpenEXR.Imath
+        else:
+            # Last resort: try importing from OpenEXR namespace
+            try:
+                from OpenEXR import Imath
+            except ImportError:
+                raise ImportError("Imath module not found. Install: pip install Imath OpenEXR")
+    
     OPENEXR_AVAILABLE = True
-except ImportError:
+except ImportError as e:
     OPENEXR_AVAILABLE = False
-    logger.warning("OpenEXR not available - EXR files cannot be read. Install: pip install OpenEXR>=3.3.1")
+    logger.warning(f"OpenEXR not available - EXR files cannot be read. Install: pip install Imath OpenEXR (or OpenEXR>=3.4.0)")
 
 
 def linear_to_srgb(linear: np.ndarray) -> np.ndarray:
@@ -77,7 +95,7 @@ def read_exr_file(exr_path: str) -> Tuple[np.ndarray, dict]:
         raise FileNotFoundError(f"EXR file not found: {exr_path}")
     
     if not OPENEXR_AVAILABLE:
-        raise ImportError("OpenEXR Python bindings not available. Install: pip install OpenEXR>=3.3.1")
+        raise ImportError("OpenEXR Python bindings not available. Install: pip install Imath OpenEXR (or OpenEXR>=3.4.0)")
     
     # Read EXR using OpenEXR (proper method for EXR files)
     exr_file = OpenEXR.InputFile(exr_path)
@@ -167,7 +185,7 @@ def write_exr_file(output_path: str, img: np.ndarray, metadata: Optional[dict] =
         metadata: Optional metadata dict from original EXR
     """
     if not OPENEXR_AVAILABLE:
-        raise ImportError("OpenEXR Python bindings not available. Install: pip install OpenEXR>=3.3.1")
+        raise ImportError("OpenEXR Python bindings not available. Install: pip install Imath OpenEXR (or OpenEXR>=3.4.0)")
     
     # Ensure float32
     img = img.astype(np.float32)
