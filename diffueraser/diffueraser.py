@@ -337,18 +337,90 @@ class DiffuEraser:
         self.guidance_scale = 0
 
     def _load_pcm_adapter(self, diffueraser_path: str, mode: str, weight_name: str) -> None:
-        """Load PCM LoRA weights into the motion UNet using load_attn_procs."""
+        """Load PCM LoRA weights into the motion UNet using load_lora_weights."""
         adapter_name = f"pcm_{mode}"
         pcm_dir = self._find_pcm_directory(diffueraser_path, mode, weight_name)
-        print(f"[PCM] Loading adapter '{adapter_name}' from: {os.path.join(pcm_dir, weight_name)}")
-        self.unet_main.load_attn_procs(
-            pcm_dir,
-            weight_name=weight_name,
-            subfolder=None,
-            adapter_name=adapter_name,
-            local_files_only=True,
-            _pipeline=self.pipeline,
-        )
+        weight_path = os.path.join(pcm_dir, weight_name)
+        print(f"[PCM] Loading adapter '{adapter_name}' from: {weight_path}")
+        
+        # Try using pipeline's load_lora_weights method first
+        # Since pipeline.unet is already set to unet_main, this will load into the motion UNet
+        try:
+            self.pipeline.load_lora_weights(
+                pcm_dir,
+                weight_name=weight_name,
+                adapter_name=adapter_name,
+                local_files_only=True,
+            )
+        except (IndexError, KeyError) as e:
+            # If rank extraction fails (IndexError: list index out of range in get_peft_kwargs),
+            # fall back to manually loading and processing the state dict
+            print(f"[PCM] Standard loading failed ({type(e).__name__}), trying manual approach...")
+            from safetensors import safe_open
+            
+            # Manually load safetensors file
+            state_dict = {}
+            with safe_open(weight_path, framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    state_dict[key] = f.get_tensor(key)
+            
+            # Extract rank from state dict manually (look for lora_B or lora_down keys)
+            rank_dict = {}
+            for key, val in state_dict.items():
+                if "lora_B" in key:
+                    rank_dict[key] = val.shape[1] if len(val.shape) > 1 else val.shape[0]
+                elif "lora_down" in key and "weight" in key:
+                    # Alternative format: lora_down.weight shape[0] is usually the rank
+                    rank_dict[key] = val.shape[0]
+            
+            if not rank_dict:
+                # If still no rank found, try to infer from lora_up or other patterns
+                for key, val in state_dict.items():
+                    if "lora_up" in key and "weight" in key and len(val.shape) >= 2:
+                        # lora_up weight shape[1] might indicate rank
+                        rank_dict[key] = val.shape[1]
+                        break
+                
+                if not rank_dict:
+                    raise RuntimeError(
+                        f"Could not determine LoRA rank from PCM weights. "
+                        f"State dict keys (first 10): {list(state_dict.keys())[:10]}"
+                    )
+            
+            # Extract network_alphas if present
+            network_alphas = None
+            alpha_keys = [k for k in state_dict.keys() if "alpha" in k.lower()]
+            if alpha_keys:
+                network_alphas = {k: float(state_dict[k]) for k in alpha_keys if state_dict[k].numel() == 1}
+            
+            # Convert state dict to PEFT format if needed
+            from diffusers.utils.peft_utils import convert_unet_state_dict_to_peft
+            try:
+                peft_state_dict = convert_unet_state_dict_to_peft(state_dict)
+            except Exception:
+                # If conversion fails, assume it's already in PEFT format
+                peft_state_dict = state_dict
+            
+            # Manually create LoraConfig and inject adapter
+            from peft import LoraConfig, inject_adapter_in_model, set_peft_model_state_dict
+            
+            # Get the most common rank
+            rank_values = list(rank_dict.values())
+            r = max(set(rank_values), key=rank_values.count) if rank_values else 8  # default to 8 if unknown
+            
+            # Extract target modules
+            target_modules = list({name.split(".lora")[0].split(".down")[0].split(".up")[0] 
+                                 for name in peft_state_dict.keys() if "lora" in name.lower()})
+            
+            lora_config = LoraConfig(
+                r=r,
+                lora_alpha=network_alphas[list(network_alphas.keys())[0]] if network_alphas else r,
+                target_modules=target_modules if target_modules else ["to_k", "to_q", "to_v", "to_out.0"],
+            )
+            
+            inject_adapter_in_model(lora_config, self.unet_main, adapter_name=adapter_name)
+            set_peft_model_state_dict(self.unet_main, peft_state_dict, adapter_name=adapter_name)
+        
         try:
             self.pipeline.set_adapters(adapter_name)
             if hasattr(self.pipeline, "set_lora_scale"):
