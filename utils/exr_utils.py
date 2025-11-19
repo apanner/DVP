@@ -3,6 +3,8 @@ EXR Utilities for VFX Production
 Handles reading/writing EXR image sequences with proper color space conversion
 USES OpenEXR Python bindings for EXR (OpenCV from pip doesn't have EXR support)
 Falls back to OpenCV for other formats
+
+NOTE: OpenEXR>=3.3.1 includes the Imath module, so no separate Imath installation needed.
 """
 import os
 import glob
@@ -16,13 +18,14 @@ logger = logging.getLogger(__name__)
 
 # Try to import OpenEXR - required for EXR file reading
 # OpenCV from pip doesn't have EXR support compiled in
+# OpenEXR>=3.3.1 includes Imath module, so import Imath works automatically
 try:
     import OpenEXR
-    import Imath
+    import Imath  # Included in OpenEXR>=3.3.1
     OPENEXR_AVAILABLE = True
 except ImportError:
     OPENEXR_AVAILABLE = False
-    logger.warning("OpenEXR not available - EXR files cannot be read. Install: pip install OpenEXR Imath")
+    logger.warning("OpenEXR not available - EXR files cannot be read. Install: pip install OpenEXR>=3.3.1")
 
 
 def linear_to_srgb(linear: np.ndarray) -> np.ndarray:
@@ -74,7 +77,7 @@ def read_exr_file(exr_path: str) -> Tuple[np.ndarray, dict]:
         raise FileNotFoundError(f"EXR file not found: {exr_path}")
     
     if not OPENEXR_AVAILABLE:
-        raise ImportError("OpenEXR Python bindings not available. Install: pip install OpenEXR Imath")
+        raise ImportError("OpenEXR Python bindings not available. Install: pip install OpenEXR>=3.3.1")
     
     # Read EXR using OpenEXR (proper method for EXR files)
     exr_file = OpenEXR.InputFile(exr_path)
@@ -125,19 +128,19 @@ def read_exr_file(exr_path: str) -> Tuple[np.ndarray, dict]:
                 g_channel = channel_names[1]
                 b_channel = channel_names[2]
             else:
-        raise ValueError(f"Could not find RGB channels in EXR file. Available: {channel_names}")
+                raise ValueError(f"Could not find RGB channels in EXR file. Available: {channel_names}")
     
     # Read pixel data as float32
     if r_channel and g_channel and b_channel:
-    r_str = exr_file.channel(r_channel, Imath.PixelType(Imath.PixelType.FLOAT))
-    g_str = exr_file.channel(g_channel, Imath.PixelType(Imath.PixelType.FLOAT))
-    b_str = exr_file.channel(b_channel, Imath.PixelType(Imath.PixelType.FLOAT))
-    
-    r = np.frombuffer(r_str, dtype=np.float32).reshape(height, width)
-    g = np.frombuffer(g_str, dtype=np.float32).reshape(height, width)
-    b = np.frombuffer(b_str, dtype=np.float32).reshape(height, width)
-    
-    # Stack into RGB image
+        r_str = exr_file.channel(r_channel, Imath.PixelType(Imath.PixelType.FLOAT))
+        g_str = exr_file.channel(g_channel, Imath.PixelType(Imath.PixelType.FLOAT))
+        b_str = exr_file.channel(b_channel, Imath.PixelType(Imath.PixelType.FLOAT))
+        
+        r = np.frombuffer(r_str, dtype=np.float32).reshape(height, width)
+        g = np.frombuffer(g_str, dtype=np.float32).reshape(height, width)
+        b = np.frombuffer(b_str, dtype=np.float32).reshape(height, width)
+        
+        # Stack into RGB image
         img_float = np.stack([r, g, b], axis=2)
     
     # Store metadata
@@ -164,7 +167,7 @@ def write_exr_file(output_path: str, img: np.ndarray, metadata: Optional[dict] =
         metadata: Optional metadata dict from original EXR
     """
     if not OPENEXR_AVAILABLE:
-        raise ImportError("OpenEXR Python bindings not available. Install: pip install OpenEXR Imath")
+        raise ImportError("OpenEXR Python bindings not available. Install: pip install OpenEXR>=3.3.1")
     
     # Ensure float32
     img = img.astype(np.float32)
@@ -264,19 +267,19 @@ def read_exr_sequence(sequence_path: str, pattern: str = "*.exr") -> Tuple[List[
     for exr_path in exr_files:
         try:
             # Read EXR (linear color space) using OpenEXR
-        img_linear, metadata = read_exr_file(exr_path)
-        
-        # Convert linear to sRGB for model processing
-        img_srgb = linear_to_srgb(img_linear)
-        
-        # Convert to uint8 [0, 255] for PIL
-        img_uint8 = (np.clip(img_srgb, 0, 1) * 255).astype(np.uint8)
-        
-        # Create PIL Image
-        pil_img = Image.fromarray(img_uint8, 'RGB')
-        
-        frames.append(pil_img)
-        metadata_list.append(metadata)
+            img_linear, metadata = read_exr_file(exr_path)
+            
+            # Convert linear to sRGB for model processing
+            img_srgb = linear_to_srgb(img_linear)
+            
+            # Convert to uint8 [0, 255] for PIL
+            img_uint8 = (np.clip(img_srgb, 0, 1) * 255).astype(np.uint8)
+            
+            # Create PIL Image
+            pil_img = Image.fromarray(img_uint8, 'RGB')
+            
+            frames.append(pil_img)
+            metadata_list.append(metadata)
         except Exception as e:
             logger.warning(f"Failed to read EXR file {exr_path}: {e}")
             # Skip this file and continue
@@ -357,28 +360,28 @@ def read_exr_mask_sequence(mask_path: str, pattern: str = "*.exr") -> List[Image
     for exr_path in exr_files:
         try:
             # Read EXR using OpenEXR
-        img_linear, _ = read_exr_file(exr_path)
-        
-        # If RGB, convert to grayscale
-        if len(img_linear.shape) == 3 and img_linear.shape[2] == 3:
-            # Use luminance: 0.2126*R + 0.7152*G + 0.0722*B
-            img_gray = (0.2126 * img_linear[:, :, 0] + 
-                       0.7152 * img_linear[:, :, 1] + 
-                       0.0722 * img_linear[:, :, 2])
-        else:
-            img_gray = img_linear[:, :, 0] if len(img_linear.shape) == 3 else img_linear
-        
-        # Normalize to [0, 1] then to [0, 255]
-        img_gray = np.clip(img_gray, 0, None)
-        img_max = img_gray.max()
-        if img_max > 0:
-            img_gray = img_gray / img_max
-        
-        img_uint8 = (img_gray * 255).astype(np.uint8)
-        
-        # Create PIL Image (grayscale)
-        pil_img = Image.fromarray(img_uint8, 'L')
-        frames.append(pil_img)
+            img_linear, _ = read_exr_file(exr_path)
+            
+            # If RGB, convert to grayscale
+            if len(img_linear.shape) == 3 and img_linear.shape[2] == 3:
+                # Use luminance: 0.2126*R + 0.7152*G + 0.0722*B
+                img_gray = (0.2126 * img_linear[:, :, 0] + 
+                           0.7152 * img_linear[:, :, 1] + 
+                           0.0722 * img_linear[:, :, 2])
+            else:
+                img_gray = img_linear[:, :, 0] if len(img_linear.shape) == 3 else img_linear
+            
+            # Normalize to [0, 1] then to [0, 255]
+            img_gray = np.clip(img_gray, 0, None)
+            img_max = img_gray.max()
+            if img_max > 0:
+                img_gray = img_gray / img_max
+            
+            img_uint8 = (img_gray * 255).astype(np.uint8)
+            
+            # Create PIL Image (grayscale)
+            pil_img = Image.fromarray(img_uint8, 'L')
+            frames.append(pil_img)
         except Exception as e:
             logger.warning(f"Failed to read EXR mask file {exr_path}: {e}")
             # Skip this file and continue
