@@ -67,8 +67,9 @@ def read_frame_from_videos(frame_root, video_length):
                 from utils.exr_utils import read_exr_sequence
                 frames, metadata_list, fps = read_exr_sequence(frame_root, pattern="*.exr")
                 nframes = len(frames)
-            except Exception as e:
-                print(f"Warning: EXR read failed via OpenCV pipeline ({e}), trying cv2 fallback")
+            except ImportError:
+                print("Warning: OpenEXR not available, trying cv2 fallback")
+                # Fallback to cv2 (may not work well for EXR)
                 fr_lst = sorted(os.listdir(frame_root))
                 for fr in fr_lst:
                     if fr.lower().endswith(('.exr', '.tiff', '.tif', '.png', '.jpg', '.jpeg')):
@@ -130,8 +131,9 @@ def read_mask(mpath, frames_len, size, flow_mask_dilates=8, mask_dilates=5):
             try:
                 from utils.exr_utils import read_exr_mask_sequence
                 masks_img = read_exr_mask_sequence(mpath, pattern="*.exr")
-            except Exception as e:
-                print(f"Warning: EXR mask read failed via OpenCV pipeline ({e}), trying PIL fallback")
+            except ImportError:
+                print("Warning: OpenEXR not available, trying PIL fallback")
+                # Fallback to PIL
                 for mp in mnames:
                     if mp.lower().endswith(('.exr', '.tiff', '.tif', '.png', '.jpg', '.jpeg')):
                         masks_img.append(Image.open(os.path.join(mpath, mp)))

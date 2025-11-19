@@ -1,6 +1,7 @@
 """
 EXR Utilities for VFX Production
 Handles reading/writing EXR image sequences with proper color space conversion
+USES OPENCV ONLY - No OpenEXR dependency
 """
 import os
 import glob
@@ -8,6 +9,9 @@ import numpy as np
 from PIL import Image
 import cv2
 from typing import List, Tuple, Optional
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def linear_to_srgb(linear: np.ndarray) -> np.ndarray:
@@ -48,68 +52,103 @@ def srgb_to_linear(srgb: np.ndarray) -> np.ndarray:
 
 def read_exr_file(exr_path: str) -> Tuple[np.ndarray, dict]:
     """
-    Read a single EXR file using OpenCV.
+    Read a single EXR file using OpenCV
     Args:
         exr_path: Path to EXR file
     Returns:
-        Tuple of (image array [H, W, C], metadata dict)
+        Tuple of (image array [H, W, C] in linear color space, metadata dict)
     """
     if not os.path.exists(exr_path):
         raise FileNotFoundError(f"EXR file not found: {exr_path}")
     
-    img = cv2.imread(exr_path, cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
-    if img is None:
-        raise ValueError(f"cv2.imread failed to load EXR: {exr_path}")
+    # Read EXR with OpenCV (IMREAD_ANYDEPTH preserves float values)
+    img_cv = cv2.imread(exr_path, cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
     
-    if len(img.shape) == 2:
-        img = np.expand_dims(img, axis=2)
+    if img_cv is None:
+        raise ValueError(f"OpenCV failed to read EXR file: {exr_path}")
     
-    if img.shape[2] == 3:
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    # Convert BGR to RGB if color image
+    if len(img_cv.shape) == 3 and img_cv.shape[2] == 3:
+        img_cv = cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB)
     
-    if img.dtype in (np.uint16, np.uint8):
-        max_val = np.iinfo(img.dtype).max
-        img = img.astype(np.float32) / max_val
+    # Handle float images (EXR uses float)
+    if img_cv.dtype != np.uint8:
+        # Normalize float images to [0, 1] range
+        if img_cv.max() > 1.0:
+            # Values are in high range (e.g., 0-65535 or 0-10000)
+            # Normalize to [0, 1] for linear color space
+            img_float = img_cv.astype(np.float32) / img_cv.max()
+        else:
+            # Values are already in [0, 1] range
+            img_float = img_cv.astype(np.float32)
     else:
-        img = img.astype(np.float32)
+        # uint8 - convert to float32 [0, 1]
+        img_float = img_cv.astype(np.float32) / 255.0
     
-    height, width = img.shape[:2]
+    height, width = img_float.shape[:2]
+    
+    # Store metadata
     metadata = {
         'width': width,
         'height': height,
-        'channels': ['R', 'G', 'B'] if img.shape[2] == 3 else ['Y'],
-        'pixel_type': str(img.dtype),
-        'source': 'opencv'
+        'channels': ['R', 'G', 'B'] if len(img_float.shape) == 3 else ['Y'],
+        'pixel_type': 'FLOAT',
+        'header': {}
     }
-    return img, metadata
+    
+    return img_float, metadata
 
 
 def write_exr_file(output_path: str, img: np.ndarray, metadata: Optional[dict] = None):
     """
-    Write an image array to EXR file
+    Write an image array to EXR file using OpenCV
     Args:
         output_path: Output EXR file path
         img: Image array in linear color space [H, W, 3] or [H, W] as numpy array
-        metadata: Optional metadata dict from original EXR
+        metadata: Optional metadata dict (not used with OpenCV, kept for compatibility)
     """
-    if img.ndim == 2:
-        img = np.expand_dims(img, axis=2)
-    
+    # Ensure float32
     img = img.astype(np.float32)
     
-    if img.shape[2] == 3:
-        img_to_write = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-    else:
-        img_to_write = img
+    # Handle different image shapes
+    if len(img.shape) == 2:
+        # Grayscale - convert to RGB
+        img = np.stack([img, img, img], axis=2)
+    elif len(img.shape) == 3:
+        if img.shape[2] == 1:
+            # Single channel - convert to RGB
+            img = np.repeat(img, 3, axis=2)
+        elif img.shape[2] == 4:
+            # RGBA - take RGB only
+            img = img[:, :, :3]
     
-    success = cv2.imwrite(output_path, img_to_write)
+    # Normalize to [0, 1] if values are outside range
+    img_max = img.max()
+    if img_max > 1.0:
+        img = img / img_max
+    
+    # Convert to uint16 for EXR-like storage (OpenCV EXR support)
+    # Scale to 0-65535 range
+    img_uint16 = (np.clip(img, 0, 1) * 65535).astype(np.uint16)
+    
+    # Convert RGB to BGR for OpenCV
+    img_bgr = cv2.cvtColor(img_uint16, cv2.COLOR_RGB2BGR)
+    
+    # Write EXR file (OpenCV supports EXR writing)
+    # Note: OpenCV's EXR writing may not preserve all metadata, but works for basic use
+    success = cv2.imwrite(output_path, img_bgr)
+    
     if not success:
-        raise RuntimeError(f"Failed to write EXR file: {output_path}")
+        # Fallback: Write as TIFF (lossless, supports float)
+        tiff_path = output_path.replace('.exr', '.tiff')
+        logger.warning(f"OpenCV EXR write failed for {output_path}, writing as TIFF: {tiff_path}")
+        cv2.imwrite(tiff_path, img_bgr)
+        raise ValueError(f"Failed to write EXR file: {output_path}")
 
 
 def read_exr_sequence(sequence_path: str, pattern: str = "*.exr") -> Tuple[List[Image.Image], List[dict], float]:
     """
-    Read EXR image sequence
+    Read EXR image sequence using OpenCV
     Args:
         sequence_path: Path to directory containing EXR files or single EXR file
         pattern: File pattern for sequence (e.g., "*.exr", "frame_*.exr")
@@ -138,20 +177,28 @@ def read_exr_sequence(sequence_path: str, pattern: str = "*.exr") -> Tuple[List[
         raise ValueError(f"No EXR files found in: {sequence_path}")
     
     for exr_path in exr_files:
-        # Read EXR (linear color space)
-        img_linear, metadata = read_exr_file(exr_path)
-        
-        # Convert linear to sRGB for model processing
-        img_srgb = linear_to_srgb(img_linear)
-        
-        # Convert to uint8 [0, 255] for PIL
-        img_uint8 = (np.clip(img_srgb, 0, 1) * 255).astype(np.uint8)
-        
-        # Create PIL Image
-        pil_img = Image.fromarray(img_uint8, 'RGB')
-        
-        frames.append(pil_img)
-        metadata_list.append(metadata)
+        try:
+            # Read EXR (linear color space) using OpenCV
+            img_linear, metadata = read_exr_file(exr_path)
+            
+            # Convert linear to sRGB for model processing
+            img_srgb = linear_to_srgb(img_linear)
+            
+            # Convert to uint8 [0, 255] for PIL
+            img_uint8 = (np.clip(img_srgb, 0, 1) * 255).astype(np.uint8)
+            
+            # Create PIL Image
+            pil_img = Image.fromarray(img_uint8, 'RGB')
+            
+            frames.append(pil_img)
+            metadata_list.append(metadata)
+        except Exception as e:
+            logger.warning(f"Failed to read EXR file {exr_path}: {e}")
+            # Skip this file and continue
+            continue
+    
+    if not frames:
+        raise ValueError(f"No EXR files could be read from: {sequence_path}")
     
     # Estimate FPS (default 24 for image sequences)
     fps = 24.0
@@ -163,11 +210,11 @@ def write_exr_sequence(frames: List[Image.Image], output_dir: str,
                       metadata_list: Optional[List[dict]] = None,
                       prefix: str = "frame", start_frame: int = 0):
     """
-    Write PIL Images to EXR sequence
+    Write PIL Images to EXR sequence using OpenCV
     Args:
         frames: List of PIL Images in sRGB [0, 255]
         output_dir: Output directory
-        metadata_list: Optional list of metadata dicts from original EXR files
+        metadata_list: Optional list of metadata dicts (not used with OpenCV, kept for compatibility)
         prefix: Filename prefix
         start_frame: Starting frame number
     """
@@ -190,19 +237,14 @@ def write_exr_sequence(frames: List[Image.Image], output_dir: str,
         # Convert sRGB to linear
         img_linear = srgb_to_linear(img_srgb)
         
-        # Get metadata if available
-        metadata = None
-        if metadata_list and i < len(metadata_list):
-            metadata = metadata_list[i]
-        
         # Write EXR file
         output_path = os.path.join(output_dir, f"{prefix}_{frame_num:04d}.exr")
-        write_exr_file(output_path, img_linear, metadata)
+        write_exr_file(output_path, img_linear, metadata_list[i] if metadata_list and i < len(metadata_list) else None)
 
 
 def read_exr_mask_sequence(mask_path: str, pattern: str = "*.exr") -> List[Image.Image]:
     """
-    Read EXR mask sequence (grayscale)
+    Read EXR mask sequence (grayscale) using OpenCV
     Args:
         mask_path: Path to directory or single EXR file
         pattern: File pattern
@@ -215,33 +257,49 @@ def read_exr_mask_sequence(mask_path: str, pattern: str = "*.exr") -> List[Image
         exr_files = [mask_path]
     elif os.path.isdir(mask_path):
         exr_files = sorted(glob.glob(os.path.join(mask_path, pattern)))
+        if not exr_files:
+            # Try common patterns
+            for pat in ["*.exr", "*.EXR", "mask.*.exr", "*.mask.exr"]:
+                exr_files = sorted(glob.glob(os.path.join(mask_path, pat)))
+                if exr_files:
+                    break
     else:
         raise ValueError(f"Invalid mask path: {mask_path}")
     
+    if not exr_files:
+        raise ValueError(f"No EXR mask files found in: {mask_path}")
+    
     for exr_path in exr_files:
-        # Read EXR
-        img_linear, _ = read_exr_file(exr_path)
-        
-        # If RGB, convert to grayscale
-        if len(img_linear.shape) == 3 and img_linear.shape[2] == 3:
-            # Use luminance: 0.2126*R + 0.7152*G + 0.0722*B
-            img_gray = (0.2126 * img_linear[:, :, 0] + 
-                       0.7152 * img_linear[:, :, 1] + 
-                       0.0722 * img_linear[:, :, 2])
-        else:
-            img_gray = img_linear[:, :, 0] if len(img_linear.shape) == 3 else img_linear
-        
-        # Normalize to [0, 1] then to [0, 255]
-        img_gray = np.clip(img_gray, 0, None)
-        img_max = img_gray.max()
-        if img_max > 0:
-            img_gray = img_gray / img_max
-        
-        img_uint8 = (img_gray * 255).astype(np.uint8)
-        
-        # Create PIL Image (grayscale)
-        pil_img = Image.fromarray(img_uint8, 'L')
-        frames.append(pil_img)
+        try:
+            # Read EXR using OpenCV
+            img_linear, _ = read_exr_file(exr_path)
+            
+            # If RGB, convert to grayscale
+            if len(img_linear.shape) == 3 and img_linear.shape[2] == 3:
+                # Use luminance: 0.2126*R + 0.7152*G + 0.0722*B
+                img_gray = (0.2126 * img_linear[:, :, 0] + 
+                          0.7152 * img_linear[:, :, 1] + 
+                          0.0722 * img_linear[:, :, 2])
+            else:
+                img_gray = img_linear[:, :, 0] if len(img_linear.shape) == 3 else img_linear
+            
+            # Normalize to [0, 1] then to [0, 255]
+            img_gray = np.clip(img_gray, 0, None)
+            img_max = img_gray.max()
+            if img_max > 0:
+                img_gray = img_gray / img_max
+            
+            img_uint8 = (img_gray * 255).astype(np.uint8)
+            
+            # Create PIL Image (grayscale)
+            pil_img = Image.fromarray(img_uint8, 'L')
+            frames.append(pil_img)
+        except Exception as e:
+            logger.warning(f"Failed to read EXR mask file {exr_path}: {e}")
+            # Skip this file and continue
+            continue
+    
+    if not frames:
+        raise ValueError(f"No EXR mask files could be read from: {mask_path}")
     
     return frames
-
