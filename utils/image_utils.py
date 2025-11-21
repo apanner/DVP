@@ -10,6 +10,10 @@ import cv2
 from typing import List, Tuple, Optional, Dict
 import logging
 
+# Enable OpenEXR support for OpenCV (like VDA/iMatte does)
+# This allows cv2.imread/cv2.imwrite to handle EXR files directly
+os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
+
 logger = logging.getLogger(__name__)
 
 # Supported VFX formats
@@ -282,7 +286,8 @@ def resize_image_sequence(input_path: str, output_path: str,
                          target_size: Tuple[int, int],
                          format_type: Optional[str] = None) -> Tuple[str, str]:
     """
-    Smart resize function - automatically detects format and preserves it
+    Resize sequence ONE FILE AT A TIME (read -> resize -> write -> next)
+    This avoids loading all frames into memory, which can hang on Windows
     
     Args:
         input_path: Input sequence path (directory or file)
@@ -295,30 +300,20 @@ def resize_image_sequence(input_path: str, output_path: str,
     """
     os.makedirs(output_path, exist_ok=True)
     
-    # Smart format detection: read sequence and auto-detect format
-    frames, metadata_list, fps, detected_format = read_image_sequence(input_path)
-    
-    # Use provided format or auto-detected format
-    output_format = format_type or detected_format
-    
-    if not output_format or output_format == 'unknown':
-        # Try to detect from input path
-        if os.path.isdir(input_path):
-            output_format = auto_detect_format_from_directory(input_path) or 'png'
-        else:
-            output_format = detect_image_format(input_path) or 'png'
-    
-    logger.info(f"Resizing sequence: {input_path} → {output_path} (format: {output_format.upper()})")
-    
-    if not frames:
-        raise ValueError(f"No frames found in: {input_path}")
-    
-    original_size = frames[0].size
-    logger.info(f"Resizing {len(frames)} frames from {original_size[0]}x{original_size[1]} to {target_size[0]}x{target_size[1]}")
-    
-    # Get file list for output naming
+    # Detect format from first file (fast - no full read)
     if os.path.isdir(input_path):
-        import glob
+        # Find first file
+        for pattern in ['*.exr', '*.EXR', '*.jpg', '*.JPG', '*.jpeg', '*.JPEG',
+                       '*.tiff', '*.TIFF', '*.tif', '*.TIF', '*.png', '*.PNG']:
+            files = sorted(glob.glob(os.path.join(input_path, pattern)))
+            if files:
+                first_file = files[0]
+                break
+        else:
+            raise ValueError(f"No image files found in: {input_path}")
+    
+        # Get all files of same format
+        detected_format = detect_image_format(first_file)
         pattern_map = {
             'exr': '*.exr',
             'jpg': '*.jpg',
@@ -327,68 +322,219 @@ def resize_image_sequence(input_path: str, output_path: str,
             'tif': '*.tiff',
             'png': '*.png'
         }
-        pattern = pattern_map.get(output_format.lower(), '*.exr')
+        pattern = pattern_map.get(detected_format.lower(), '*.exr')
         input_files = sorted(glob.glob(os.path.join(input_path, pattern)))
     else:
         input_files = [input_path]
+        detected_format = detect_image_format(input_path)
     
-    # Resize and save frames using OpenCV
-    for i, frame in enumerate(frames):
-        # Convert PIL to numpy array (RGB)
-        img_np = np.array(frame)
+    # Use provided format or detected
+    output_format = format_type or detected_format
+    if not output_format or output_format == 'unknown':
+        output_format = 'png'
+    
+    logger.info(f"Resizing sequence: {input_path} → {output_path}")
+    logger.info(f"Format: {output_format.upper()}, Files: {len(input_files)}, Target: {target_size[0]}x{target_size[1]}")
+    
+    if not input_files:
+        raise ValueError(f"No files found in: {input_path}")
         
-        # Convert RGB to BGR for OpenCV
-        if len(img_np.shape) == 3:
-            img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
-        else:
-            img_bgr = img_np
-        
-        # Resize using OpenCV (fast and simple)
-        resized_bgr = cv2.resize(img_bgr, target_size, interpolation=cv2.INTER_LANCZOS4)
-        
-        # Convert back to RGB
-        if len(resized_bgr.shape) == 3:
-            resized_rgb = cv2.cvtColor(resized_bgr, cv2.COLOR_BGR2RGB)
-        else:
-            resized_rgb = resized_bgr
-        
-        # Convert back to PIL Image
-        resized_pil = Image.fromarray(resized_rgb)
-        
-        # Determine output filename
-        if input_files and i < len(input_files):
-            base_name = os.path.splitext(os.path.basename(input_files[i]))[0]
+    # Process ONE FILE AT A TIME (read -> resize -> write -> next)
+    def process_single_file(file_path, file_index):
+        """Process a single file: read -> resize -> write"""
+        try:
+            filename = os.path.basename(file_path)
+            logger.info(f"   Processing [{file_index+1}/{len(input_files)}]: {filename}...")
+            
+            # Determine output filename
+            base_name = os.path.splitext(filename)[0]
             ext = output_format.lower()
             if ext == 'jpeg':
                 ext = 'jpg'
             output_filename = f"{base_name}.{ext}"
-        else:
-            output_filename = f"frame_{i:04d}.{output_format.lower()}"
-        
-        output_file = os.path.join(output_path, output_filename)
-        
-        # Save based on format
-        if output_format.lower() == 'exr':
-            # Use EXR utils for EXR
-            try:
-                from utils.exr_utils import write_exr_file, srgb_to_linear
-                # Convert PIL to numpy for EXR writing
-                img_array = np.array(resized_pil).astype(np.float32) / 255.0
-                # Convert sRGB to linear for EXR
-                img_linear = srgb_to_linear(img_array)
-                # Get metadata if available
-                metadata = metadata_list[i] if i < len(metadata_list) else None
-                write_exr_file(output_file, img_linear, metadata)
-            except Exception as e:
-                logger.error(f"Failed to write EXR: {e}, falling back to PNG")
-                resized_pil.save(output_file.replace('.exr', '.png'), 'PNG')
-        elif output_format.lower() in ['jpg', 'jpeg']:
-            resized_pil.save(output_file, 'JPEG', quality=95)
-        elif output_format.lower() in ['tiff', 'tif']:
-            resized_pil.save(output_file, 'TIFF', compression='lzw')
-        else:  # PNG
-            resized_pil.save(output_file, 'PNG')
+            output_file = os.path.join(output_path, output_filename)
+            
+            # Read file based on format
+            if output_format.lower() == 'exr':
+                # Use OpenImageIO for EXR (works great in Colab, simpler than OpenEXR)
+                logger.info(f"   [READ] Reading EXR with OpenImageIO: {filename}...")
+                
+                try:
+                    import OpenImageIO as oiio
+                    
+                    # Read EXR using OpenImageIO (handles all formats automatically)
+                    img_buf = oiio.ImageBuf(str(file_path))
+                    if img_buf.has_error:
+                        raise ValueError(f"Failed to read EXR: {img_buf.geterror()}")
+                    
+                    # Get image specs
+                    spec = img_buf.spec()
+                    width = spec.width
+                    height = spec.height
+                    nchannels = spec.nchannels
+                    
+                    logger.info(f"   [READ] EXR read complete! Size: {width}x{height}, Channels: {nchannels}")
+                    
+                    # Resize using OpenImageIO's built-in resize (like sample_exr.py)
+                    # This handles EXR properly with Lanczos3 filter
+                    logger.info(f"   [RESIZE] Resizing with OpenImageIO (Lanczos3)...")
+                    resized_buf = oiio.ImageBuf()
+                    roi = oiio.ROI(0, target_size[0], 0, target_size[1])
+                    oiio.ImageBufAlgo.resize(resized_buf, img_buf, filtername="lanczos3", roi=roi)
+                    
+                    if resized_buf.has_error:
+                        raise ValueError(f"Failed to resize EXR: {resized_buf.geterror()}")
+                    
+                    # Write EXR using OpenImageIO (simple and reliable!)
+                    logger.info(f"   [WRITE] Writing EXR with OpenImageIO: {output_filename}...")
+                    resized_buf.write(str(output_file))
+                    
+                    if resized_buf.has_error:
+                        raise ValueError(f"Failed to write EXR: {resized_buf.geterror()}")
+                    
+                    if not os.path.exists(output_file):
+                        raise ValueError(f"EXR file was not created: {output_file}")
+                    
+                    logger.info(f"   ✅ [{file_index+1}/{len(input_files)}] {filename} → {output_filename} (OpenImageIO)")
+                    
+                except ImportError:
+                    logger.info(f"   [READ] OpenImageIO not available, trying imageio...")
+                    # Fallback to imageio
+                    try:
+                        import imageio
+                        img = imageio.imread(file_path)
+                        if img is None:
+                            raise ValueError(f"Failed to read EXR file: {file_path}")
+                        
+                        # Handle channels
+                        if len(img.shape) == 2:
+                            img = np.stack([img, img, img], axis=2)
+                        elif len(img.shape) == 3 and img.shape[2] == 4:
+                            img = img[:, :, :3]
+                        
+                        # Normalize and resize
+                        img_normalized = np.clip(img, 0, None)
+                        img_max = img_normalized.max()
+                        img_for_resize = img_normalized / img_max if img_max > 1.0 else img_normalized
+                        
+                        img_uint8 = (np.clip(img_for_resize, 0, 1) * 255).astype(np.uint8)
+                        img_bgr = cv2.cvtColor(img_uint8, cv2.COLOR_RGB2BGR)
+                        resized_bgr = cv2.resize(img_bgr, target_size, interpolation=cv2.INTER_LANCZOS4)
+                        resized_rgb = cv2.cvtColor(resized_bgr, cv2.COLOR_BGR2RGB)
+                        resized_float = resized_rgb.astype(np.float32) / 255.0
+                        
+                        if img_max > 1.0:
+                            resized_float = resized_float * img_max
+                        
+                        imageio.imwrite(output_file, resized_float, format='EXR-FI')
+                        logger.info(f"   ✅ [{file_index+1}/{len(input_files)}] {filename} → {output_filename} (imageio)")
+                    except ImportError:
+                        logger.info(f"   [READ] imageio not available, using OpenEXR Python bindings...")
+                        # Last fallback: OpenEXR Python bindings
+                        from utils.exr_utils import read_exr_file, linear_to_srgb, srgb_to_linear, write_exr_file
+                        
+                        img_linear, metadata = read_exr_file(file_path)
+                        img_srgb = linear_to_srgb(img_linear)
+                        img_normalized = np.clip(img_srgb, 0, 1)
+                        
+                        img_uint8 = (img_normalized * 255).astype(np.uint8)
+                        img_bgr = cv2.cvtColor(img_uint8, cv2.COLOR_RGB2BGR)
+                        resized_bgr = cv2.resize(img_bgr, target_size, interpolation=cv2.INTER_LANCZOS4)
+                        resized_rgb = cv2.cvtColor(resized_bgr, cv2.COLOR_BGR2RGB)
+                        resized_float = resized_rgb.astype(np.float32) / 255.0
+                        resized_linear = srgb_to_linear(resized_float)
+                        
+                        metadata = {'width': target_size[0], 'height': target_size[1]}
+                        write_exr_file(output_file, resized_linear, metadata)
+                        logger.info(f"   ✅ [{file_index+1}/{len(input_files)}] {filename} → {output_filename} (OpenEXR)")
+                    
+                except Exception as e:
+                    logger.error(f"   ❌ Error processing EXR {filename}: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+                    raise
+                
+            else:
+                # Read with PIL for other formats
+                img = Image.open(file_path)
+                
+                # Convert to RGB if needed
+                if img.mode != 'RGB':
+                    if img.mode == 'RGBA':
+                        background = Image.new('RGB', img.size, (255, 255, 255))
+                        background.paste(img, mask=img.split()[3] if len(img.split()) == 4 else None)
+                        img = background
+                    else:
+                        img = img.convert('RGB')
+                
+                # Convert to numpy for OpenCV
+                img_np = np.array(img)
+                img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+                
+                # Resize using OpenCV (Lanczos4 - same as DVP/Cell3)
+                resized_bgr = cv2.resize(img_bgr, target_size, interpolation=cv2.INTER_LANCZOS4)
+                resized_rgb = cv2.cvtColor(resized_bgr, cv2.COLOR_BGR2RGB)
+                resized_pil = Image.fromarray(resized_rgb)
+                
+                # Save based on format
+                if output_format.lower() in ['jpg', 'jpeg']:
+                    resized_pil.save(output_file, 'JPEG', quality=95)
+                elif output_format.lower() in ['tiff', 'tif']:
+                    resized_pil.save(output_file, 'TIFF', compression='lzw')
+                else:  # PNG
+                    resized_pil.save(output_file, 'PNG')
+                
+                logger.info(f"   ✅ [{file_index+1}/{len(input_files)}] {filename} → {output_filename}")
+            
+            return True
+        except Exception as e:
+            logger.error(f"❌ Error processing [{file_index+1}/{len(input_files)}] {os.path.basename(file_path)}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return False
     
+    # Process files - SEQUENTIAL for EXR (OpenEXR not thread-safe on Windows)
+    # For other formats, can use parallel processing
+    if output_format.lower() == 'exr':
+        # EXR: Process sequentially (OpenEXR not thread-safe on Windows)
+        logger.info(f"Processing {len(input_files)} EXR files SEQUENTIALLY (OpenEXR not thread-safe)...")
+        completed = 0
+        failed = 0
+        
+        for i, file_path in enumerate(input_files):
+            result = process_single_file(file_path, i)
+            if result:
+                completed += 1
+            else:
+                failed += 1
+            
+            if (i + 1) % 5 == 0 or (i + 1) == len(input_files):
+                logger.info(f"   Progress: {completed} succeeded, {failed} failed / {len(input_files)} total")
+    else:
+        # Other formats: Can use parallel processing
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import multiprocessing
+        
+        num_workers = min(multiprocessing.cpu_count(), 8, len(input_files))
+        logger.info(f"Processing {len(input_files)} files in parallel using {num_workers} workers...")
+        
+        completed = 0
+        failed = 0
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            futures = {executor.submit(process_single_file, file_path, i): (i, file_path) 
+                      for i, file_path in enumerate(input_files)}
+            
+            for future in as_completed(futures):
+                result = future.result()
+                if result:
+                    completed += 1
+                else:
+                    failed += 1
+                
+                if (completed + failed) % 5 == 0 or (completed + failed) == len(input_files):
+                    logger.info(f"   Progress: {completed} succeeded, {failed} failed / {len(input_files)} total")
+    
+    logger.info(f"   ✅ All {len(input_files)} files processed")
     logger.info(f"Resized sequence saved to: {output_path}")
     
     return output_path, output_format
@@ -396,7 +542,7 @@ def resize_image_sequence(input_path: str, output_path: str,
 
 def get_sequence_resolution(sequence_path: str) -> Optional[Tuple[int, int]]:
     """
-    Get resolution of first frame in sequence
+    Get resolution of first frame in sequence (FAST - reads only one file header)
     
     Args:
         sequence_path: Path to sequence
@@ -405,9 +551,55 @@ def get_sequence_resolution(sequence_path: str) -> Optional[Tuple[int, int]]:
         (width, height) or None if cannot read
     """
     try:
-        frames, _, _, _ = read_image_sequence(sequence_path)
-        if frames:
-            return frames[0].size
+        # FAST: Find first file and read only its header/metadata, not all frames
+        if os.path.isfile(sequence_path):
+            first_file = sequence_path
+        elif os.path.isdir(sequence_path):
+            # Find first image file
+            for pattern in ['*.exr', '*.EXR', '*.tiff', '*.TIFF', '*.tif', '*.TIF', 
+                           '*.png', '*.PNG', '*.jpg', '*.JPG', '*.jpeg', '*.JPEG']:
+                files = sorted(glob.glob(os.path.join(sequence_path, pattern)))
+                if files:
+                    first_file = files[0]
+                    break
+            else:
+                return None
+        else:
+            return None
+        
+        # Detect format and read only header/metadata
+        format_type = detect_image_format(first_file)
+        
+        if format_type == 'exr':
+            # EXR: Read only header (very fast) - don't read full file!
+            try:
+                # Check if OpenEXR is available
+                from utils.exr_utils import OPENEXR_AVAILABLE
+                if not OPENEXR_AVAILABLE:
+                    raise ImportError("OpenEXR not available")
+                
+                import OpenEXR
+                # Only read header, not full file - this is FAST!
+                exr_file = OpenEXR.InputFile(first_file)
+                header = exr_file.header()
+                dw = header['dataWindow']
+                width = dw.max.x - dw.min.x + 1
+                height = dw.max.y - dw.min.y + 1
+                exr_file.close()
+                logger.debug(f"Read EXR header: {width}x{height} from {first_file}")
+                return (width, height)
+            except Exception as e:
+                logger.warning(f"Could not read EXR header from {first_file}: {e}")
+                # Fallback: try PIL (may not work for EXR, but worth trying)
+                try:
+                    img = Image.open(first_file)
+                    return img.size
+                except Exception:
+                    return None
+        else:
+            # Other formats: Use PIL (reads only header, not full image)
+            img = Image.open(first_file)
+            return img.size
     except Exception as e:
         logger.warning(f"Could not get resolution from {sequence_path}: {e}")
     

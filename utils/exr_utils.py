@@ -16,6 +16,10 @@ import cv2
 from typing import List, Tuple, Optional
 import logging
 
+# Set OpenEXR environment variable for Windows compatibility
+# This disables threading which can cause hangs on Windows
+os.environ['OPENEXR_THREADS'] = '1'
+
 logger = logging.getLogger(__name__)
 
 # Try to import OpenEXR - required for EXR file reading
