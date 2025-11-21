@@ -4,6 +4,7 @@ Supports EXR, JPG, TIFF, PNG with proper format handling
 """
 import os
 import glob
+import shutil
 import numpy as np
 from PIL import Image
 import cv2
@@ -15,6 +16,11 @@ import logging
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 
 logger = logging.getLogger(__name__)
+
+
+class ExrResizeError(Exception):
+    """Raised when EXR resize fails and fallback is required."""
+    pass
 
 # Supported VFX formats
 SUPPORTED_FORMATS = ['exr', 'EXR', 'jpg', 'jpeg', 'JPG', 'JPEG', 'tiff', 'tif', 'TIFF', 'TIF', 'png', 'PNG']
@@ -272,7 +278,7 @@ def read_image_sequence(sequence_path: str, pattern: str = None, is_mask: bool =
             logger.warning(f"OpenImageIO EXR read failed: {e}, trying fallback")
             format_type = 'png'  # Fallback
     
-    # Read using PIL for standard formats
+    # Read using PIL for standard formats (supports 8-bit and 16-bit TIFF)
     for img_path in image_files:
         try:
             if format_type == 'exr':
@@ -280,6 +286,17 @@ def read_image_sequence(sequence_path: str, pattern: str = None, is_mask: bool =
                 img = Image.open(img_path)
             else:
                 img = Image.open(img_path)
+            
+            # Handle 16-bit TIFF: convert to 8-bit for processing (engine uses uint8)
+            if format_type == 'tiff' and img.mode in ['I;16', 'I;16B', 'I;16L', 'RGB;16L', 'RGB;16B']:
+                # 16-bit TIFF detected - convert to 8-bit for engine processing
+                img_array = np.array(img, dtype=np.uint16)
+                # Normalize 16-bit (0-65535) to 8-bit (0-255)
+                if img_array.max() > 255:
+                    img_array = (img_array / 256).astype(np.uint8)
+                else:
+                    img_array = img_array.astype(np.uint8)
+                img = Image.fromarray(img_array)
             
             # Convert based on whether it's a mask or image
             if is_mask:
@@ -360,7 +377,17 @@ def write_image_sequence(frames: List[Image.Image], output_dir: str,
         if format_type.lower() in ['jpg', 'jpeg']:
             pil_img.save(output_path, 'JPEG', quality=95)
         elif format_type.lower() in ['tiff', 'tif']:
-            pil_img.save(output_path, 'TIFF', compression='lzw')
+            # Save as 16-bit TIFF for better quality (if image is suitable)
+            # Convert to 16-bit if original has enough precision
+            if pil_img.mode == 'RGB':
+                # Convert RGB uint8 to RGB uint16 for better quality
+                img_array = np.array(pil_img, dtype=np.uint16)
+                img_array = (img_array * 256)  # Scale 8-bit to 16-bit range
+                pil_img_16bit = Image.fromarray(img_array, mode='RGB')
+                pil_img_16bit.save(output_path, 'TIFF', compression='lzw')
+            else:
+                # For other modes, save as 8-bit
+                pil_img.save(output_path, 'TIFF', compression='lzw')
         else:  # PNG
             pil_img.save(output_path, 'PNG')
 
@@ -535,7 +562,8 @@ def resize_image_sequence(input_path: str, output_path: str,
                     logger.error(f"   ❌ Error processing EXR {filename}: {e}")
                     import traceback
                     logger.error(traceback.format_exc())
-                    raise
+                    # Signal to outer loop that EXR workflow failed so we can fallback
+                    raise ExrResizeError(str(e)) from e
                 
             else:
                 # Read with PIL for other formats
@@ -563,7 +591,15 @@ def resize_image_sequence(input_path: str, output_path: str,
                 if output_format.lower() in ['jpg', 'jpeg']:
                     resized_pil.save(output_file, 'JPEG', quality=95)
                 elif output_format.lower() in ['tiff', 'tif']:
-                    resized_pil.save(output_file, 'TIFF', compression='lzw')
+                    # Save as 16-bit TIFF for better quality
+                    if resized_pil.mode == 'RGB':
+                        # Convert RGB uint8 to RGB uint16
+                        img_array = np.array(resized_pil, dtype=np.uint16)
+                        img_array = (img_array * 256)  # Scale 8-bit to 16-bit range
+                        resized_pil_16bit = Image.fromarray(img_array, mode='RGB')
+                        resized_pil_16bit.save(output_file, 'TIFF', compression='lzw')
+                    else:
+                        resized_pil.save(output_file, 'TIFF', compression='lzw')
                 else:  # PNG
                     resized_pil.save(output_file, 'PNG')
                 
@@ -583,16 +619,21 @@ def resize_image_sequence(input_path: str, output_path: str,
         logger.info(f"Processing {len(input_files)} EXR files SEQUENTIALLY (OpenEXR not thread-safe)...")
         completed = 0
         failed = 0
-        
-        for i, file_path in enumerate(input_files):
-            result = process_single_file(file_path, i)
-            if result:
-                completed += 1
-            else:
-                failed += 1
-            
-            if (i + 1) % 5 == 0 or (i + 1) == len(input_files):
-                logger.info(f"   Progress: {completed} succeeded, {failed} failed / {len(input_files)} total")
+        try:
+            for i, file_path in enumerate(input_files):
+                result = process_single_file(file_path, i)
+                if result:
+                    completed += 1
+                else:
+                    failed += 1
+                
+                if (i + 1) % 5 == 0 or (i + 1) == len(input_files):
+                    logger.info(f"   Progress: {completed} succeeded, {failed} failed / {len(input_files)} total")
+        except ExrResizeError as exr_err:
+            logger.warning(f"EXR resize failed ({exr_err}); falling back to 16-bit TIFF workspace...")
+            # Clean partially written files before fallback
+            shutil.rmtree(output_path, ignore_errors=True)
+            return resize_image_sequence(input_path, output_path, target_size, format_type='tiff')
     else:
         # Other formats: Can use parallel processing
         from concurrent.futures import ThreadPoolExecutor, as_completed
