@@ -169,24 +169,107 @@ def read_image_sequence(sequence_path: str, pattern: str = None, is_mask: bool =
             logger.warning(f"Could not detect format, defaulting to PNG")
             format_type = 'png'
     
-    # Import EXR utils if needed
+    # Use OpenImageIO for EXR files (works great in Colab)
     if format_type == 'exr':
         try:
-            from utils.exr_utils import read_exr_sequence, read_exr_mask_sequence
-            if is_mask:
-                # Use mask-specific EXR reader for masks
-                frames = read_exr_mask_sequence(sequence_path, pattern or "*.exr")
-                metadata_list = [{'path': '', 'format': 'exr', 'size': f.size} for f in frames]
+            import OpenImageIO as oiio
+            
+            logger.info(f"Reading EXR sequence with OpenImageIO: {sequence_path}")
+            frames = []
+            metadata_list = []
+            
+            for img_path in image_files:
+                try:
+                    # Read EXR with OpenImageIO
+                    img_buf = oiio.ImageBuf(str(img_path))
+                    if img_buf.has_error:
+                        logger.warning(f"Failed to read EXR: {img_buf.geterror()}")
+                        continue
+                    
+                    # Get image specs
+                    spec = img_buf.spec()
+                    width = spec.width
+                    height = spec.height
+                    nchannels = spec.nchannels
+                    
+                    # Get pixel data as numpy array (float32)
+                    img_array = img_buf.get_pixels(oiio.FLOAT)
+                    img = np.array(img_array).reshape((height, width, nchannels))
+                    
+                    # Handle different channel formats
+                    if nchannels == 1:
+                        # Grayscale - convert to RGB
+                        img = np.stack([img[:, :, 0], img[:, :, 0], img[:, :, 0]], axis=2)
+                    elif nchannels == 3:
+                        # RGB - keep as is
+                        pass
+                    elif nchannels == 4:
+                        # RGBA to RGB (drop alpha)
+                        img = img[:, :, :3]
+                    elif nchannels > 4:
+                        # Multi-channel - take first 3
+                        img = img[:, :, :3]
+                    
+                    # Convert to PIL Image
+                    # OpenImageIO reads as float32, may have HDR values > 1
+                    # Normalize to 0-1 range for PIL (clip HDR values)
+                    img_normalized = np.clip(img, 0, None)
+                    img_max = img_normalized.max()
+                    if img_max > 1.0:
+                        # HDR - normalize to 0-1 for PIL
+                        img_normalized = img_normalized / img_max
+                    
+                    # Convert to uint8 for PIL
+                    img_uint8 = (img_normalized * 255).astype(np.uint8)
+                    pil_img = Image.fromarray(img_uint8)
+                    
+                    # Convert based on whether it's a mask or image
+                    if is_mask:
+                        # For masks, convert to grayscale (L mode)
+                        if pil_img.mode != 'L':
+                            pil_img = pil_img.convert('L')
+                    else:
+                        # For images, ensure RGB
+                        if pil_img.mode != 'RGB':
+                            pil_img = pil_img.convert('RGB')
+                    
+                    frames.append(pil_img)
+                    metadata_list.append({
+                        'path': img_path,
+                        'format': 'exr',
+                        'size': (width, height)
+                    })
+                except Exception as e:
+                    logger.warning(f"Failed to read EXR {img_path}: {e}")
+                    continue
+            
+            if frames:
                 fps = 24.0
+                logger.info(f"✅ Read {len(frames)} EXR frames with OpenImageIO")
                 return frames, metadata_list, fps, 'exr'
             else:
-                frames, metadata_list, fps = read_exr_sequence(sequence_path, pattern or "*.exr")
-                return frames, metadata_list, fps, 'exr'
+                logger.warning("No EXR frames could be read, trying fallback")
+                format_type = 'png'  # Fallback
         except ImportError:
-            logger.warning("OpenEXR not available, trying PIL fallback")
-            format_type = 'png'  # Fallback
+            logger.warning("OpenImageIO not available, trying OpenEXR Python bindings...")
+            try:
+                from utils.exr_utils import read_exr_sequence, read_exr_mask_sequence
+                if is_mask:
+                    frames = read_exr_mask_sequence(sequence_path, pattern or "*.exr")
+                    metadata_list = [{'path': '', 'format': 'exr', 'size': f.size} for f in frames]
+                    fps = 24.0
+                    return frames, metadata_list, fps, 'exr'
+                else:
+                    frames, metadata_list, fps = read_exr_sequence(sequence_path, pattern or "*.exr")
+                    return frames, metadata_list, fps, 'exr'
+            except ImportError:
+                logger.warning("OpenEXR not available, trying PIL fallback")
+                format_type = 'png'  # Fallback
+            except Exception as e:
+                logger.warning(f"EXR read failed: {e}, trying PIL fallback")
+                format_type = 'png'  # Fallback
         except Exception as e:
-            logger.warning(f"EXR read failed: {e}, trying PIL fallback")
+            logger.warning(f"OpenImageIO EXR read failed: {e}, trying fallback")
             format_type = 'png'  # Fallback
     
     # Read using PIL for standard formats
@@ -573,21 +656,36 @@ def get_sequence_resolution(sequence_path: str) -> Optional[Tuple[int, int]]:
         if format_type == 'exr':
             # EXR: Read only header (very fast) - don't read full file!
             try:
-                # Check if OpenEXR is available
-                from utils.exr_utils import OPENEXR_AVAILABLE
-                if not OPENEXR_AVAILABLE:
-                    raise ImportError("OpenEXR not available")
-                
-                import OpenEXR
-                # Only read header, not full file - this is FAST!
-                exr_file = OpenEXR.InputFile(first_file)
-                header = exr_file.header()
-                dw = header['dataWindow']
-                width = dw.max.x - dw.min.x + 1
-                height = dw.max.y - dw.min.y + 1
-                exr_file.close()
-                logger.debug(f"Read EXR header: {width}x{height} from {first_file}")
-                return (width, height)
+                # Try OpenImageIO first (works great in Colab)
+                import OpenImageIO as oiio
+                img_buf = oiio.ImageBuf(str(first_file))
+                if not img_buf.has_error:
+                    spec = img_buf.spec()
+                    width = spec.width
+                    height = spec.height
+                    logger.debug(f"Read EXR header with OpenImageIO: {width}x{height} from {first_file}")
+                    return (width, height)
+                else:
+                    raise ValueError(f"OpenImageIO error: {img_buf.geterror()}")
+            except ImportError:
+                # Fallback to OpenEXR Python bindings
+                try:
+                    from utils.exr_utils import OPENEXR_AVAILABLE
+                    if not OPENEXR_AVAILABLE:
+                        raise ImportError("OpenEXR not available")
+                    
+                    import OpenEXR
+                    # Only read header, not full file - this is FAST!
+                    exr_file = OpenEXR.InputFile(first_file)
+                    header = exr_file.header()
+                    dw = header['dataWindow']
+                    width = dw.max.x - dw.min.x + 1
+                    height = dw.max.y - dw.min.y + 1
+                    exr_file.close()
+                    logger.debug(f"Read EXR header: {width}x{height} from {first_file}")
+                    return (width, height)
+                except Exception as e:
+                    logger.warning(f"Could not read EXR header from {first_file}: {e}")
             except Exception as e:
                 logger.warning(f"Could not read EXR header from {first_file}: {e}")
                 # Fallback: try PIL (may not work for EXR, but worth trying)
