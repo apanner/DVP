@@ -342,8 +342,8 @@ class DiffuEraser:
         validation_prompt = ""  # 
         guidance_scale_final = self.guidance_scale if guidance_scale==None else guidance_scale
 
-        if (max_img_size<256 or max_img_size>1920):
-            raise ValueError("The max_img_size must be larger than 256, smaller than 1920.")
+        if (max_img_size<256 or max_img_size>4096):
+            raise ValueError("The max_img_size must be larger than 256, smaller than 4096.")
 
         ################ read input video ################ 
         frames, fps, img_size, n_clip, n_total_frames = read_video(validation_image, video_length, nframes, max_img_size)
