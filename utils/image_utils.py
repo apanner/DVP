@@ -257,7 +257,51 @@ def read_image_sequence(sequence_path: str, pattern: str = None, is_mask: bool =
                 logger.warning("No EXR frames could be read, trying fallback")
                 format_type = 'png'  # Fallback
         except ImportError:
-            logger.warning("OpenImageIO not available, trying OpenEXR Python bindings...")
+            logger.info("OpenImageIO not available, trying OpenCV...")
+            try:
+                # OpenCV Fallback for EXR
+                frames = []
+                metadata_list = []
+                for img_path in image_files:
+                    # Read with OpenCV (loads as BGR float32)
+                    img = cv2.imread(str(img_path), cv2.IMREAD_UNCHANGED)
+                    if img is None:
+                        logger.warning(f"Failed to read EXR with OpenCV: {img_path}")
+                        continue
+                    
+                    # Handle channels
+                    if len(img.shape) == 2:
+                        img = np.stack([img, img, img], axis=2)
+                    elif len(img.shape) == 3:
+                        # Convert BGR to RGB
+                        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                        if img.shape[2] > 3:
+                            img = img[:, :, :3] # Drop alpha if present
+                    
+                    # Convert to PIL
+                    # Normalize float32 to uint8 for PIL
+                    img_normalized = np.clip(img, 0, 1)
+                    img_uint8 = (img_normalized * 255).astype(np.uint8)
+                    pil_img = Image.fromarray(img_uint8)
+                    
+                    if is_mask:
+                         if pil_img.mode != 'L':
+                             pil_img = pil_img.convert('L')
+                    else:
+                        if pil_img.mode != 'RGB':
+                            pil_img = pil_img.convert('RGB')
+                         
+                    frames.append(pil_img)
+                    metadata_list.append({'path': img_path, 'format': 'exr', 'size': (img.shape[1], img.shape[0])})
+                
+                if frames:
+                    fps = 24.0
+                    logger.info(f"✅ Read {len(frames)} EXR frames with OpenCV")
+                    return frames, metadata_list, fps, 'exr'
+            except Exception as e:
+                logger.warning(f"OpenCV EXR read failed: {e}")
+                
+            logger.warning("OpenCV not available/failed, trying OpenEXR Python bindings...")
             try:
                 from utils.exr_utils import read_exr_sequence, read_exr_mask_sequence
                 if is_mask:
@@ -351,7 +395,24 @@ def write_image_sequence(frames: List[Image.Image], output_dir: str,
         frame_num = start_frame + i
         
         if format_type.lower() == 'exr':
-            # Use EXR utils
+            output_path = os.path.join(output_dir, f"{prefix}_{frame_num:04d}.exr")
+            
+            # Try OpenCV first (Fast and reliable)
+            try:
+                # Convert PIL to BGR numpy array
+                img_np = np.array(pil_img)
+                if len(img_np.shape) == 2:
+                    img_bgr = img_np
+                elif len(img_np.shape) == 3:
+                    img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+                
+                # Write using OpenCV
+                cv2.imwrite(output_path, img_bgr)
+                continue
+            except Exception as e:
+                logger.warning(f"OpenCV EXR write failed: {e}")
+
+            # Fallback to EXR utils
             try:
                 from utils.exr_utils import write_exr_sequence
                 # Write single frame
@@ -466,105 +527,55 @@ def resize_image_sequence(input_path: str, output_path: str,
             
             # Read file based on format
             if output_format.lower() == 'exr':
-                # Use OpenImageIO for EXR (works great in Colab, simpler than OpenEXR)
-                logger.info(f"   [READ] Reading EXR with OpenImageIO: {filename}...")
-                
+                # Use OpenCV for EXR (Fast and Reliable in Colab)
+                # OpenCV supports EXR if OPENCV_IO_ENABLE_OPENEXR=1 is set (which we did at top of file)
                 try:
-                    import OpenImageIO as oiio
+                    # Read with OpenCV (loads as BGR float32)
+                    # IMREAD_UNCHANGED is critical for EXR to keep float precision and channels
+                    img = cv2.imread(file_path, cv2.IMREAD_UNCHANGED)
                     
-                    # Read EXR using OpenImageIO (handles all formats automatically)
-                    img_buf = oiio.ImageBuf(str(file_path))
-                    if img_buf.has_error:
-                        raise ValueError(f"Failed to read EXR: {img_buf.geterror()}")
+                    if img is None:
+                        raise ValueError(f"Failed to read EXR with OpenCV: {file_path}")
                     
-                    # Get image specs
-                    spec = img_buf.spec()
-                    width = spec.width
-                    height = spec.height
-                    nchannels = spec.nchannels
+                    # Resize
+                    # INTER_LANCZOS4 is high quality
+                    resized_img = cv2.resize(img, target_size, interpolation=cv2.INTER_LANCZOS4)
                     
-                    logger.info(f"   [READ] EXR read complete! Size: {width}x{height}, Channels: {nchannels}")
-                    
-                    # Resize using OpenImageIO's built-in resize (like sample_exr.py)
-                    # This handles EXR properly with Lanczos3 filter
-                    logger.info(f"   [RESIZE] Resizing with OpenImageIO (Lanczos3)...")
-                    resized_buf = oiio.ImageBuf()
-                    roi = oiio.ROI(0, target_size[0], 0, target_size[1])
-                    oiio.ImageBufAlgo.resize(resized_buf, img_buf, filtername="lanczos3", roi=roi)
-                    
-                    if resized_buf.has_error:
-                        raise ValueError(f"Failed to resize EXR: {resized_buf.geterror()}")
-                    
-                    # Write EXR using OpenImageIO (simple and reliable!)
-                    logger.info(f"   [WRITE] Writing EXR with OpenImageIO: {output_filename}...")
-                    resized_buf.write(str(output_file))
-                    
-                    if resized_buf.has_error:
-                        raise ValueError(f"Failed to write EXR: {resized_buf.geterror()}")
+                    # Write
+                    # OpenCV handles EXR writing automatically based on extension
+                    cv2.imwrite(output_file, resized_img)
                     
                     if not os.path.exists(output_file):
                         raise ValueError(f"EXR file was not created: {output_file}")
-                    
-                    logger.info(f"   ✅ [{file_index+1}/{len(input_files)}] {filename} → {output_filename} (OpenImageIO)")
-                    
-                except ImportError:
-                    logger.info(f"   [READ] OpenImageIO not available, trying imageio...")
-                    # Fallback to imageio
-                    try:
-                        import imageio
-                        img = imageio.imread(file_path)
-                        if img is None:
-                            raise ValueError(f"Failed to read EXR file: {file_path}")
                         
-                        # Handle channels
-                        if len(img.shape) == 2:
-                            img = np.stack([img, img, img], axis=2)
-                        elif len(img.shape) == 3 and img.shape[2] == 4:
-                            img = img[:, :, :3]
-                        
-                        # Normalize and resize
-                        img_normalized = np.clip(img, 0, None)
-                        img_max = img_normalized.max()
-                        img_for_resize = img_normalized / img_max if img_max > 1.0 else img_normalized
-                        
-                        img_uint8 = (np.clip(img_for_resize, 0, 1) * 255).astype(np.uint8)
-                        img_bgr = cv2.cvtColor(img_uint8, cv2.COLOR_RGB2BGR)
-                        resized_bgr = cv2.resize(img_bgr, target_size, interpolation=cv2.INTER_LANCZOS4)
-                        resized_rgb = cv2.cvtColor(resized_bgr, cv2.COLOR_BGR2RGB)
-                        resized_float = resized_rgb.astype(np.float32) / 255.0
-                        
-                        if img_max > 1.0:
-                            resized_float = resized_float * img_max
-                        
-                        imageio.imwrite(output_file, resized_float, format='EXR-FI')
-                        logger.info(f"   ✅ [{file_index+1}/{len(input_files)}] {filename} → {output_filename} (imageio)")
-                    except ImportError:
-                        logger.info(f"   [READ] imageio not available, using OpenEXR Python bindings...")
-                        # Last fallback: OpenEXR Python bindings
-                        from utils.exr_utils import read_exr_file, linear_to_srgb, srgb_to_linear, write_exr_file
-                        
-                        img_linear, metadata = read_exr_file(file_path)
-                        img_srgb = linear_to_srgb(img_linear)
-                        img_normalized = np.clip(img_srgb, 0, 1)
-                        
-                        img_uint8 = (img_normalized * 255).astype(np.uint8)
-                        img_bgr = cv2.cvtColor(img_uint8, cv2.COLOR_RGB2BGR)
-                        resized_bgr = cv2.resize(img_bgr, target_size, interpolation=cv2.INTER_LANCZOS4)
-                        resized_rgb = cv2.cvtColor(resized_bgr, cv2.COLOR_BGR2RGB)
-                        resized_float = resized_rgb.astype(np.float32) / 255.0
-                        resized_linear = srgb_to_linear(resized_float)
-                        
-                        metadata = {'width': target_size[0], 'height': target_size[1]}
-                        write_exr_file(output_file, resized_linear, metadata)
-                        logger.info(f"   ✅ [{file_index+1}/{len(input_files)}] {filename} → {output_filename} (OpenEXR)")
+                    logger.info(f"   ✅ [{file_index+1}/{len(input_files)}] {filename} → {output_filename} (OpenCV)")
+                    return True
                     
                 except Exception as e:
-                    logger.error(f"   ❌ Error processing EXR {filename}: {e}")
-                    import traceback
-                    logger.error(traceback.format_exc())
-                    # Signal to outer loop that EXR workflow failed so we can fallback
-                    raise ExrResizeError(str(e)) from e
-                
+                    logger.error(f"   ❌ OpenCV EXR processing failed: {e}")
+                    # Fallback to OpenImageIO if OpenCV fails (unlikely in Colab)
+                    try:
+                        import OpenImageIO as oiio
+                        logger.info(f"   [FALLBACK] Trying OpenImageIO for {filename}...")
+                        
+                        img_buf = oiio.ImageBuf(str(file_path))
+                        if img_buf.has_error:
+                            raise ValueError(f"OIIO Read Error: {img_buf.geterror()}")
+                            
+                        resized_buf = oiio.ImageBuf()
+                        roi = oiio.ROI(0, target_size[0], 0, target_size[1])
+                        oiio.ImageBufAlgo.resize(resized_buf, img_buf, filtername="lanczos3", roi=roi)
+                        
+                        resized_buf.write(str(output_file))
+                        if resized_buf.has_error:
+                            raise ValueError(f"OIIO Write Error: {resized_buf.geterror()}")
+                            
+                        logger.info(f"   ✅ [{file_index+1}/{len(input_files)}] {filename} → {output_filename} (OpenImageIO)")
+                        return True
+                    except Exception as e2:
+                        logger.error(f"   ❌ OpenImageIO fallback failed: {e2}")
+                        raise ExrResizeError(f"All EXR resize methods failed for {filename}")
+
             else:
                 # Read with PIL for other formats
                 img = Image.open(file_path)
