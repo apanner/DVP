@@ -406,8 +406,12 @@ def write_image_sequence(frames: List[Image.Image], output_dir: str,
                 elif len(img_np.shape) == 3:
                     img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
                 
+                # Convert to float32 and normalize to 0-1 for EXR
+                # This is critical because readers (including ours) expect EXR to be 0-1 float
+                img_float = img_bgr.astype(np.float32) / 255.0
+                
                 # Write using OpenCV
-                cv2.imwrite(output_path, img_bgr)
+                cv2.imwrite(output_path, img_float)
                 continue
             except Exception as e:
                 logger.warning(f"OpenCV EXR write failed: {e}")
@@ -625,6 +629,12 @@ def resize_image_sequence(input_path: str, output_path: str,
     
     # Process files - SEQUENTIAL for EXR (OpenEXR not thread-safe on Windows)
     # For other formats, can use parallel processing
+    try:
+        from tqdm.auto import tqdm
+        pbar = tqdm(total=len(input_files), desc=f"Resizing {output_format.upper()}", unit="frame")
+    except ImportError:
+        pbar = None
+
     if output_format.lower() == 'exr':
         # EXR: Process sequentially (OpenEXR not thread-safe on Windows)
         logger.info(f"Processing {len(input_files)} EXR files SEQUENTIALLY (OpenEXR not thread-safe)...")
@@ -638,9 +648,15 @@ def resize_image_sequence(input_path: str, output_path: str,
                 else:
                     failed += 1
                 
-                if (i + 1) % 5 == 0 or (i + 1) == len(input_files):
+                if pbar:
+                    pbar.update(1)
+                elif (i + 1) % 5 == 0 or (i + 1) == len(input_files):
                     logger.info(f"   Progress: {completed} succeeded, {failed} failed / {len(input_files)} total")
+            
+            if pbar: pbar.close()
+            
         except ExrResizeError as exr_err:
+            if pbar: pbar.close()
             logger.warning(f"EXR resize failed ({exr_err}); falling back to 16-bit TIFF workspace...")
             # Clean partially written files before fallback
             shutil.rmtree(output_path, ignore_errors=True)
@@ -666,8 +682,12 @@ def resize_image_sequence(input_path: str, output_path: str,
                 else:
                     failed += 1
                 
-                if (completed + failed) % 5 == 0 or (completed + failed) == len(input_files):
+                if pbar:
+                    pbar.update(1)
+                elif (completed + failed) % 5 == 0 or (completed + failed) == len(input_files):
                     logger.info(f"   Progress: {completed} succeeded, {failed} failed / {len(input_files)} total")
+        
+        if pbar: pbar.close()
     
     logger.info(f"   ✅ All {len(input_files)} files processed")
     logger.info(f"Resized sequence saved to: {output_path}")

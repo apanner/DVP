@@ -561,37 +561,22 @@ class Propainter:
                         else:
                             output_format = 'png'
             
-            # Try to use EXR utilities for high-quality output
-            try:
-                from utils.exr_utils import write_exr_file
-                from utils.image_utils import write_image_sequence
-                use_exr = (output_format == 'exr')
-            except ImportError:
-                use_exr = False
-                from utils.image_utils import write_image_sequence
+            # Save as image sequence using robust image_utils
+            # This handles EXR (via OpenCV), TIFF, PNG, JPG automatically
+            from utils.image_utils import write_image_sequence
             
-            if use_exr:
-                # Save as EXR (high quality, float32)
-                for f in range(video_length):
-                    frame = comp_frames[f].astype(np.float32) / 255.0  # Convert to [0, 1] float
-                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    # Write EXR (linear color space)
-                    frame_filename = os.path.join(output_path, f"frame_{f:04d}.exr")
-                    write_exr_file(frame_filename, frame_rgb)
-                print(f"Saved {video_length} EXR frames to: {output_path}")
-            else:
-                # Save using image_utils (supports EXR, TIFF, PNG, JPG)
-                frames_pil = []
-                for f in range(video_length):
-                    frame = comp_frames[f].astype(np.uint8)
-                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    frame_pil = Image.fromarray(frame_rgb)
-                    frames_pil.append(frame_pil)
-                
-                # Use write_image_sequence which handles format conversion
-                write_image_sequence(frames_pil, output_path, format_type=output_format, 
-                                   prefix="frame", start_frame=0)
-                print(f"Saved {video_length} {output_format.upper()} frames to: {output_path}")
+            frames_pil = []
+            for f in range(video_length):
+                # Convert BGR to RGB
+                frame = comp_frames[f].astype(np.uint8)
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frame_pil = Image.fromarray(frame_rgb)
+                frames_pil.append(frame_pil)
+            
+            # Use write_image_sequence which handles format conversion and EXR writing via OpenCV
+            write_image_sequence(frames_pil, output_path, format_type=output_format, 
+                               prefix="frame", start_frame=0)
+            print(f"Saved {video_length} {output_format.upper()} frames to: {output_path}")
         else:
             # Save as video (original behavior)
             writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"),
